@@ -2801,9 +2801,15 @@ def delete_material(material_id: int):
 
 
 @router.get("/qc/list")
-def qc_list(order_no: str = "", material_no: str = "", region: str = ""):
+def qc_list(order_no: str = "", material_no: str = "", region: str = "", status: str = ""):
     _ensure_order_details_loaded()
-    target = [r for r in order_details if r["status"] not in ("开始", "分割", "加工")]
+    status_text = _normalize_str(status)
+    if status_text:
+        if status_text not in ORDER_STATUSES:
+            raise HTTPException(status_code=400, detail=f"非法订单状态: {status_text}")
+        target = [r for r in order_details if r["status"] == status_text]
+    else:
+        target = [r for r in order_details if r["status"] not in ("开始", "分割", "加工")]
     if order_no:
         target = [r for r in target if r["order_no"] == order_no]
     if material_no:
@@ -2814,10 +2820,13 @@ def qc_list(order_no: str = "", material_no: str = "", region: str = ""):
 
 
 @router.get("/qc/snapshots")
-def qc_snapshot_list(order_no: str = "", material_no: str = "", region: str = ""):
-    if not _normalize_str(order_no) and not _normalize_str(material_no):
-        raise HTTPException(status_code=400, detail="请至少填写订单号或物料号")
-    rows = query_snapshots(region=region, order_no=order_no, material_no=material_no)
+def qc_snapshot_list(order_no: str = "", material_no: str = "", region: str = "", status: str = ""):
+    status_text = _normalize_str(status)
+    if not _normalize_str(order_no) and not _normalize_str(material_no) and not status_text:
+        raise HTTPException(status_code=400, detail="请至少填写订单号、物料号或状态")
+    if status_text and status_text not in ORDER_STATUSES:
+        raise HTTPException(status_code=400, detail=f"非法订单状态: {status_text}")
+    rows = query_snapshots(region=region, order_no=order_no, material_no=material_no, status=status_text)
     return {"status": "success", "total": len(rows), "rows": rows}
 
 

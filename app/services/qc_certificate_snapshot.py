@@ -239,26 +239,42 @@ def query_snapshots(
     region: str = "",
     order_no: str = "",
     material_no: str = "",
+    status: str = "",
 ) -> list[dict[str, Any]]:
-    """查询快照列表，按 region / order_no / material_no 过滤。"""
+    """查询快照列表，按 region / order_no / material_no / order_details 状态 过滤。"""
     conditions: list[str] = []
     params: list[Any] = []
+    join_order_details = bool(_normalize_str(status))
+    table_prefix = "s." if join_order_details else ""
+
     if order_no:
-        conditions.append("order_no = %s")
+        conditions.append(f"{table_prefix}order_no = %s")
         params.append(order_no.strip())
     if material_no:
-        conditions.append("LOWER(material_no) LIKE %s")
+        conditions.append(f"LOWER({table_prefix}material_no) LIKE %s")
         params.append(f"%{material_no.strip().lower()}%")
     region_text = region.strip().lower()
     if region_text == "dalian":
-        conditions.append("order_no LIKE '4%'")
+        conditions.append(f"{table_prefix}order_no LIKE '4%'")
     elif region_text == "france":
-        conditions.append("order_no NOT LIKE '4%'")
+        conditions.append(f"{table_prefix}order_no NOT LIKE '4%'")
+    status_text = _normalize_str(status)
+    if status_text:
+        conditions.append("od.order_status = %s")
+        params.append(status_text)
+
     where = " AND ".join(conditions) if conditions else "1=1"
-    rows = fetch_all(
-        f"SELECT * FROM qc_certificate_snapshots WHERE {where} ORDER BY updated_at DESC, id DESC",
-        tuple(params),
-    )
+    if join_order_details:
+        sql = f"""
+            SELECT s.*
+            FROM qc_certificate_snapshots s
+            INNER JOIN order_details od ON od.id = s.order_detail_id
+            WHERE {where}
+            ORDER BY s.updated_at DESC, s.id DESC
+        """
+    else:
+        sql = f"SELECT * FROM qc_certificate_snapshots WHERE {where} ORDER BY updated_at DESC, id DESC"
+    rows = fetch_all(sql, tuple(params))
     return [snapshot_row_to_dict(r) for r in rows]
 
 
