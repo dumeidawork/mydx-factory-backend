@@ -1,13 +1,20 @@
+# Python virtualenv
 venv/
 __pycache__/
 *.pyc
+
+# env files
 .env
 .env.local
 .env.*.local
 .env.production
 .env.development
+
+# logs and instance
 *.log
 instance/
+
+# editor / OS
 .vscode/
 .idea/
 .DS_Store
