@@ -1,0 +1,581 @@
+{
+  "label": "11-FR-qc/A105",
+  "source_pdf": "C:\\Users\\dumei\\OneDrive\\デスクトップ\\铭远数字化\\ERPMingYuan\\backend\\templates\\11-FR-qc\\pdf\\A105\\quality_certificate.pdf",
+  "page_count": 1,
+  "field_count": 41,
+  "unique_names": [
+    "CEQ_raw_bar",
+    "CEQ_self_inspection",
+    "C_raw_bar",
+    "C_self_inspection",
+    "Cr_raw_bar",
+    "Cr_self_inspection",
+    "Cu_raw_bar",
+    "Cu_self_inspection",
+    "Mn_raw_bar",
+    "Mn_self_inspection",
+    "Mo_raw_bar",
+    "Mo_self_inspection",
+    "Ni_raw_bar",
+    "Ni_self_inspection",
+    "P_raw_bar",
+    "P_self_inspection",
+    "S_raw_bar",
+    "S_self_inspection",
+    "Si_raw_bar",
+    "Si_self_inspection",
+    "V_raw_bar",
+    "V_self_inspection",
+    "batch_no",
+    "cert_no",
+    "contract_no",
+    "date",
+    "drawing_no",
+    "heat_no",
+    "mech_elongation",
+    "mech_hardness",
+    "mech_impact",
+    "mech_reduction",
+    "mech_tensile",
+    "mech_yield",
+    "part_no",
+    "qty",
+    "spec",
+    "works_no"
+  ],
+  "fields": [
+    {
+      "name": "cert_no",
+      "page": 0,
+      "rect": [
+        124.7,
+        108.6,
+        165.8,
+        118.5
+      ],
+      "font_size": 9.0,
+      "align": "center",
+      "multiline": false
+    },
+    {
+      "name": "contract_no",
+      "page": 0,
+      "rect": [
+        83.1,
+        176.9,
+        154.4,
+        188.7
+      ],
+      "font_size": 10.6,
+      "align": "center",
+      "multiline": false
+    },
+    {
+      "name": "date",
+      "page": 0,
+      "rect": [
+        252.5,
+        176.9,
+        289.5,
+        188.7
+      ],
+      "font_size": 10.6,
+      "align": "center",
+      "multiline": false
+    },
+    {
+      "name": "works_no",
+      "page": 0,
+      "rect": [
+        426.5,
+        176.9,
+        488.0,
+        188.7
+      ],
+      "font_size": 10.6,
+      "align": "center",
+      "multiline": false
+    },
+    {
+      "name": "qty",
+      "page": 0,
+      "rect": [
+        48.1,
+        308.8,
+        73.3,
+        317.8
+      ],
+      "font_size": 9.0,
+      "align": "center",
+      "multiline": false
+    },
+    {
+      "name": "drawing_no",
+      "page": 0,
+      "rect": [
+        106.3,
+        302.9,
+        163.3,
+        311.9
+      ],
+      "font_size": 9.0,
+      "align": "center",
+      "multiline": false
+    },
+    {
+      "name": "part_no",
+      "page": 0,
+      "rect": [
+        203.9,
+        308.8,
+        246.4,
+        317.8
+      ],
+      "font_size": 9.0,
+      "align": "center",
+      "multiline": false
+    },
+    {
+      "name": "spec",
+      "page": 0,
+      "rect": [
+        294.8,
+        308.8,
+        324.7,
+        317.8
+      ],
+      "font_size": 9.0,
+      "align": "center",
+      "multiline": false
+    },
+    {
+      "name": "heat_no",
+      "page": 0,
+      "rect": [
+        376.9,
+        308.8,
+        420.7,
+        317.8
+      ],
+      "font_size": 9.0,
+      "align": "center",
+      "multiline": false
+    },
+    {
+      "name": "batch_no",
+      "page": 0,
+      "rect": [
+        489.0,
+        308.8,
+        536.9,
+        317.8
+      ],
+      "font_size": 9.0,
+      "align": "center",
+      "multiline": false
+    },
+    {
+      "name": "heat_no",
+      "page": 0,
+      "rect": [
+        50.2,
+        402.9,
+        94.0,
+        411.9
+      ],
+      "font_size": 9.0,
+      "align": "center",
+      "multiline": false
+    },
+    {
+      "name": "mech_yield",
+      "page": 0,
+      "rect": [
+        177.9,
+        403.8,
+        224.5,
+        412.6
+      ],
+      "font_size": 7.6,
+      "align": "center",
+      "multiline": false
+    },
+    {
+      "name": "mech_tensile",
+      "page": 0,
+      "rect": [
+        240.9,
+        403.8,
+        293.3,
+        412.6
+      ],
+      "font_size": 7.6,
+      "align": "center",
+      "multiline": false
+    },
+    {
+      "name": "mech_elongation",
+      "page": 0,
+      "rect": [
+        302.7,
+        400.5,
+        352.8,
+        417.1
+      ],
+      "font_size": 7.6,
+      "align": "center",
+      "multiline": true
+    },
+    {
+      "name": "mech_reduction",
+      "page": 0,
+      "rect": [
+        354.2,
+        400.5,
+        409.1,
+        417.1
+      ],
+      "font_size": 7.6,
+      "align": "center",
+      "multiline": true
+    },
+    {
+      "name": "mech_hardness",
+      "page": 0,
+      "rect": [
+        410.7,
+        400.5,
+        466.1,
+        417.1
+      ],
+      "font_size": 7.6,
+      "align": "center",
+      "multiline": true
+    },
+    {
+      "name": "mech_impact",
+      "page": 0,
+      "rect": [
+        495.8,
+        403.8,
+        548.8,
+        412.6
+      ],
+      "font_size": 7.6,
+      "align": "center",
+      "multiline": false
+    },
+    {
+      "name": "heat_no",
+      "page": 0,
+      "rect": [
+        36.0,
+        520.6,
+        70.1,
+        527.5
+      ],
+      "font_size": 7.0,
+      "align": "center",
+      "multiline": false
+    },
+    {
+      "name": "C_raw_bar",
+      "page": 0,
+      "rect": [
+        142.0,
+        520.2,
+        174.8,
+        533.9
+      ],
+      "font_size": 7.0,
+      "align": "center",
+      "multiline": true
+    },
+    {
+      "name": "Mn_raw_bar",
+      "page": 0,
+      "rect": [
+        176.1,
+        520.2,
+        219.5,
+        533.9
+      ],
+      "font_size": 7.0,
+      "align": "center",
+      "multiline": true
+    },
+    {
+      "name": "P_raw_bar",
+      "page": 0,
+      "rect": [
+        221.7,
+        520.2,
+        254.4,
+        533.9
+      ],
+      "font_size": 7.0,
+      "align": "center",
+      "multiline": true
+    },
+    {
+      "name": "S_raw_bar",
+      "page": 0,
+      "rect": [
+        257.1,
+        520.2,
+        294.1,
+        533.9
+      ],
+      "font_size": 7.0,
+      "align": "center",
+      "multiline": true
+    },
+    {
+      "name": "Si_raw_bar",
+      "page": 0,
+      "rect": [
+        296.5,
+        520.2,
+        337.2,
+        527.2
+      ],
+      "font_size": 7.0,
+      "align": "center",
+      "multiline": false
+    },
+    {
+      "name": "Cu_raw_bar",
+      "page": 0,
+      "rect": [
+        296.5,
+        520.2,
+        373.3,
+        533.9
+      ],
+      "font_size": 7.0,
+      "align": "center",
+      "multiline": true
+    },
+    {
+      "name": "Ni_raw_bar",
+      "page": 0,
+      "rect": [
+        376.6,
+        520.2,
+        408.5,
+        533.9
+      ],
+      "font_size": 7.0,
+      "align": "center",
+      "multiline": true
+    },
+    {
+      "name": "Cr_raw_bar",
+      "page": 0,
+      "rect": [
+        410.2,
+        520.2,
+        445.6,
+        533.9
+      ],
+      "font_size": 7.0,
+      "align": "center",
+      "multiline": true
+    },
+    {
+      "name": "Mo_raw_bar",
+      "page": 0,
+      "rect": [
+        446.1,
+        520.2,
+        481.6,
+        533.9
+      ],
+      "font_size": 7.0,
+      "align": "center",
+      "multiline": true
+    },
+    {
+      "name": "V_raw_bar",
+      "page": 0,
+      "rect": [
+        482.3,
+        520.2,
+        515.3,
+        533.9
+      ],
+      "font_size": 7.0,
+      "align": "center",
+      "multiline": true
+    },
+    {
+      "name": "CEQ_raw_bar",
+      "page": 0,
+      "rect": [
+        521.1,
+        520.2,
+        570.6,
+        527.2
+      ],
+      "font_size": 7.0,
+      "align": "center",
+      "multiline": false
+    },
+    {
+      "name": "C_self_inspection",
+      "page": 0,
+      "rect": [
+        141.9,
+        539.3,
+        174.8,
+        553.0
+      ],
+      "font_size": 7.0,
+      "align": "center",
+      "multiline": true
+    },
+    {
+      "name": "Mn_self_inspection",
+      "page": 0,
+      "rect": [
+        176.5,
+        539.3,
+        219.1,
+        553.0
+      ],
+      "font_size": 7.0,
+      "align": "center",
+      "multiline": true
+    },
+    {
+      "name": "P_self_inspection",
+      "page": 0,
+      "rect": [
+        221.7,
+        539.3,
+        254.5,
+        553.0
+      ],
+      "font_size": 7.0,
+      "align": "center",
+      "multiline": true
+    },
+    {
+      "name": "S_self_inspection",
+      "page": 0,
+      "rect": [
+        257.5,
+        539.3,
+        293.6,
+        553.0
+      ],
+      "font_size": 7.0,
+      "align": "center",
+      "multiline": true
+    },
+    {
+      "name": "Si_self_inspection",
+      "page": 0,
+      "rect": [
+        296.2,
+        539.3,
+        337.4,
+        553.0
+      ],
+      "font_size": 7.0,
+      "align": "center",
+      "multiline": true
+    },
+    {
+      "name": "Cu_self_inspection",
+      "page": 0,
+      "rect": [
+        339.7,
+        539.3,
+        373.5,
+        553.0
+      ],
+      "font_size": 7.0,
+      "align": "center",
+      "multiline": true
+    },
+    {
+      "name": "Ni_self_inspection",
+      "page": 0,
+      "rect": [
+        376.1,
+        539.3,
+        408.7,
+        553.0
+      ],
+      "font_size": 7.0,
+      "align": "center",
+      "multiline": true
+    },
+    {
+      "name": "Cr_self_inspection",
+      "page": 0,
+      "rect": [
+        410.1,
+        539.3,
+        445.6,
+        553.0
+      ],
+      "font_size": 7.0,
+      "align": "center",
+      "multiline": true
+    },
+    {
+      "name": "Mo_self_inspection",
+      "page": 0,
+      "rect": [
+        447.6,
+        539.3,
+        481.7,
+        553.0
+      ],
+      "font_size": 7.0,
+      "align": "center",
+      "multiline": true
+    },
+    {
+      "name": "V_self_inspection",
+      "page": 0,
+      "rect": [
+        482.1,
+        539.3,
+        515.3,
+        553.0
+      ],
+      "font_size": 7.0,
+      "align": "center",
+      "multiline": true
+    },
+    {
+      "name": "CEQ_self_inspection",
+      "page": 0,
+      "rect": [
+        517.4,
+        539.3,
+        572.6,
+        553.0
+      ],
+      "font_size": 7.0,
+      "align": "center",
+      "multiline": true
+    },
+    {
+      "name": "date",
+      "page": 0,
+      "rect": [
+        80.1,
+        793.7,
+        109.4,
+        803.7
+      ],
+      "font_size": 9.0,
+      "align": "center",
+      "multiline": false
+    }
+  ]
+}
