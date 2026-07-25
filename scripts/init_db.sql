@@ -173,11 +173,14 @@ CREATE TABLE IF NOT EXISTS order_details (
     quantity INT DEFAULT 0,
     unit_weight DECIMAL(12,2) DEFAULT 0,
     total_weight DECIMAL(12,2) DEFAULT 0,
+    agreement_price DECIMAL(12,2) NOT NULL DEFAULT 0.00 COMMENT '协议价',
+    product_unit_price DECIMAL(12,2) NOT NULL DEFAULT 0.00 COMMENT '产品单价',
     remark1 VARCHAR(255),
     remark2 VARCHAR(255),
     heat_no VARCHAR(64),
     heat_treatment_batch_no VARCHAR(64),
     order_status VARCHAR(32) DEFAULT '开始',
+    doc_status VARCHAR(32) NOT NULL DEFAULT '' COMMENT '资料状态：空/待补资料',
     upload_type VARCHAR(32) DEFAULT '手动录入',
     material_mode VARCHAR(32),
     started_at DATETIME,
@@ -340,7 +343,7 @@ CREATE TABLE IF NOT EXISTS heat_treatment_trial_records (
     test_date VARCHAR(8) COMMENT '日期 yyyymmdd',
     heat_no VARCHAR(50) NOT NULL COMMENT '炉号',
     batch_no VARCHAR(50) NOT NULL COMMENT '热处理批号',
-    spec_model VARCHAR(255) COMMENT '规格型号',
+    spec_model VARCHAR(255) NOT NULL DEFAULT '' COMMENT '规格型号',
     mech_yield_strength VARCHAR(50) NOT NULL COMMENT '屈服标准',
     mech_tensile_strength VARCHAR(50) NOT NULL COMMENT '抗拉标准',
     mech_elongation VARCHAR(50) NOT NULL COMMENT '延伸标准',
@@ -351,12 +354,13 @@ CREATE TABLE IF NOT EXISTS heat_treatment_trial_records (
     mech_impact_test VARCHAR(100) NOT NULL COMMENT '-20℃下冲击标准',
     seq_no VARCHAR(50) COMMENT '序号',
     supplier_hardness VARCHAR(100) COMMENT '热处理厂硬度',
-    material_no VARCHAR(128) COMMENT '物料号',
+    material_no VARCHAR(128) NOT NULL DEFAULT '' COMMENT '物料号',
     remark VARCHAR(255) COMMENT '备注',
     material VARCHAR(64) COMMENT '材料',
     updated_by VARCHAR(50) NOT NULL COMMENT '更新者',
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
-    INDEX idx_trial_heat_batch (heat_no, batch_no)
+    INDEX idx_trial_heat_batch (heat_no, batch_no),
+    UNIQUE KEY uk_trial_heat_batch_material_spec (heat_no, batch_no, material_no, spec_model)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='试验记录表';
 
 CREATE TABLE IF NOT EXISTS heat_treatment_chemical_records (
@@ -432,3 +436,43 @@ INSERT IGNORE INTO document_templates (id, doc_type, language, version, template
 (1, 'quality_certificate', 'zh-CN', 'v1.0', '质保书-默认模板', '质保书默认文本模板(v1.0)', 1),
 (2, 'packing_list', 'zh-CN', 'v1.0', '装箱单-默认模板', '装箱单默认文本模板(v1.0)', 1),
 (3, 'shipping_mark', 'zh-CN', 'v1.0', '唛头-默认模板', '唛头默认文本模板(v1.0)', 1);
+
+-- 客户原始合同归档
+CREATE TABLE IF NOT EXISTS customer_contract_archives (
+    id INT PRIMARY KEY AUTO_INCREMENT,
+    customer_name VARCHAR(128) NOT NULL COMMENT '客户名',
+    file_name VARCHAR(255) NOT NULL COMMENT '原始文件名',
+    version VARCHAR(32) NOT NULL DEFAULT 'V0.0.0' COMMENT '版本号',
+    upload_date DATE NOT NULL COMMENT '上传日期(可手选)',
+    uploaded_by_user_id INT NULL,
+    uploaded_by_name VARCHAR(64) NOT NULL DEFAULT '',
+    updated_date DATE NULL COMMENT '更新日期(可手选，首次上传可空)',
+    updated_by_user_id INT NULL,
+    updated_by_name VARCHAR(64) NOT NULL DEFAULT '',
+    summary TEXT NULL COMMENT '合同概述',
+    owner_user_id INT NULL COMMENT '业务负责人',
+    owner_name VARCHAR(64) NULL,
+    storage_relative_path VARCHAR(1024) NOT NULL COMMENT '相对 contract_archives 根目录',
+    file_size BIGINT NOT NULL DEFAULT 0,
+    content_type VARCHAR(128) NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    UNIQUE KEY uk_archive_identity (customer_name, file_name, version, upload_date),
+    INDEX idx_archive_customer (customer_name),
+    INDEX idx_archive_owner (owner_user_id),
+    INDEX idx_archive_upload_date (upload_date),
+    INDEX idx_archive_updated_date (updated_date)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='客户原始合同归档';
+
+CREATE TABLE IF NOT EXISTS customer_contract_archive_logs (
+    id BIGINT PRIMARY KEY AUTO_INCREMENT,
+    archive_id INT NULL,
+    action VARCHAR(32) NOT NULL COMMENT 'create/update_meta/version_update/download/assign_owner/export/delete',
+    operator_user_id INT NULL,
+    operator_name VARCHAR(64) NOT NULL DEFAULT '',
+    operated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    change_summary TEXT NULL COMMENT '变更内容 JSON/文本',
+    INDEX idx_archive_log_archive (archive_id),
+    INDEX idx_archive_log_action (action),
+    INDEX idx_archive_log_time (operated_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='客户原始合同归档操作日志';

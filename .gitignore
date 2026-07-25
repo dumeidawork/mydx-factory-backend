@@ -1,5 +1,6 @@
 # Python virtualenv
 venv/
+.venv/
 __pycache__/
 *.pyc
 
@@ -18,3 +19,9 @@ instance/
 .vscode/
 .idea/
 .DS_Store
+
+# runtime / local storage under backend (legacy)
+storage/logs/
+storage/generated/
+storage/exports/
+**/__pycache__/

@@ -298,6 +298,160 @@ def _json_diff_line(before: dict[str, Any], after: dict[str, Any]) -> str:
     return f"old={json.dumps(before, ensure_ascii=False)} new={json.dumps(after, ensure_ascii=False)}"
 
 
+TRIAL_CONTENT_FIELDS = (
+    "test_date",
+    "heat_no",
+    "batch_no",
+    "spec_model",
+    "yield_strength",
+    "tensile_strength",
+    "elongation",
+    "reduction_area",
+    "hardness",
+    "impact_test",
+    "seq_no",
+    "supplier_hardness",
+    "material_no",
+    "remark",
+    "material",
+)
+
+
+def _trial_business_key(row: dict) -> tuple[str, str, str, str]:
+    if "mech_yield_strength" in row:
+        return (
+            _normalize_str(row.get("heat_no", "")),
+            _normalize_str(row.get("batch_no", "")),
+            _normalize_str(row.get("material_no", "")),
+            _normalize_str(row.get("spec_model", "")),
+        )
+    return (
+        _normalize_str(row.get("heat_no", "")),
+        _normalize_str(row.get("batch_no", "")),
+        _normalize_str(row.get("material_no", "")),
+        _normalize_str(row.get("spec_model", "")),
+    )
+
+
+def _trial_key_label(key: tuple[str, str, str, str]) -> str:
+    heat_no, batch_no, material_no, spec_model = key
+    return (
+        f"炉号【{heat_no or '/'}】热处理批号【{batch_no or '/'}】"
+        f"物料号【{material_no or '/'}】规格型号【{spec_model or '/'}】"
+    )
+
+
+def _trial_content_snapshot(row: dict) -> dict[str, str]:
+    if "mech_yield_strength" in row:
+        payload = _trial_row_to_payload(row)
+    else:
+        payload = {
+            "test_date": row.get("test_date", "") or "",
+            "heat_no": row.get("heat_no", "") or "",
+            "batch_no": row.get("batch_no", "") or "",
+            "spec_model": row.get("spec_model", "") or "",
+            "yield_strength": row.get("yield_strength", "") or "",
+            "tensile_strength": row.get("tensile_strength", "") or "",
+            "elongation": row.get("elongation", "") or "",
+            "reduction_area": row.get("reduction_area", "") or "",
+            "hardness": row.get("hardness", "") or "",
+            "impact_test": row.get("impact_test", "") or "",
+            "seq_no": row.get("seq_no", "") or "",
+            "supplier_hardness": row.get("supplier_hardness", "") or "",
+            "material_no": row.get("material_no", "") or "",
+            "remark": row.get("remark", "") or "",
+            "material": row.get("material", "") or "",
+        }
+    return {field: str(payload.get(field, "") or "") for field in TRIAL_CONTENT_FIELDS}
+
+
+def _trial_content_equal(row_a: dict, row_b: dict) -> bool:
+    return _trial_content_snapshot(row_a) == _trial_content_snapshot(row_b)
+
+
+def _execute_trial_update(row: dict, row_id: int, updated_by: str, existing_by_id: dict[int, dict]) -> dict:
+    hardness_1, hardness_2, hardness_3 = _split_hardness(row["hardness"])
+    before = _trial_row_to_payload(existing_by_id.get(row_id))
+    after = {**row, "id": row_id, "updated_by": updated_by}
+    execute(
+        """
+        UPDATE heat_treatment_trial_records
+        SET test_date=%s, heat_no=%s, batch_no=%s, spec_model=%s,
+            mech_yield_strength=%s, mech_tensile_strength=%s, mech_elongation=%s, mech_reduction_area=%s,
+            mech_hardness_1=%s, mech_hardness_2=%s, mech_hardness_3=%s, mech_impact_test=%s,
+            seq_no=%s, supplier_hardness=%s, material_no=%s, remark=%s, material=%s,
+            updated_by=%s, updated_at=NOW()
+        WHERE id=%s
+        """,
+        (
+            row["test_date"] or None,
+            row["heat_no"],
+            row["batch_no"],
+            row["spec_model"] or "",
+            row["yield_strength"],
+            row["tensile_strength"],
+            row["elongation"],
+            row["reduction_area"],
+            hardness_1,
+            hardness_2,
+            hardness_3,
+            row["impact_test"],
+            row["seq_no"] or None,
+            row["supplier_hardness"] or None,
+            row["material_no"] or "",
+            row["remark"] or None,
+            row["material"] or None,
+            updated_by,
+            row_id,
+        ),
+    )
+    if before != {**after, "updated_at": before.get("updated_at", "")}:
+        _append_log_line(
+            f"heat_trial_change_{datetime.now().strftime('%Y-%m-%d')}.log",
+            (
+                f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} "
+                f"heat_no={row['heat_no']} batch_no={row['batch_no']} row_id={row_id} "
+                f"{_json_diff_line(before, after)}\n"
+            ),
+        )
+    return {**row, "id": row_id, "updated_by": updated_by}
+
+
+def _execute_trial_insert(row: dict, updated_by: str) -> dict:
+    hardness_1, hardness_2, hardness_3 = _split_hardness(row["hardness"])
+    inserted_id = execute(
+        """
+        INSERT INTO heat_treatment_trial_records (
+            test_date, heat_no, batch_no, spec_model,
+            mech_yield_strength, mech_tensile_strength, mech_elongation, mech_reduction_area,
+            mech_hardness_1, mech_hardness_2, mech_hardness_3, mech_impact_test,
+            seq_no, supplier_hardness, material_no, remark, material, updated_by
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        """,
+        (
+            row["test_date"] or None,
+            row["heat_no"],
+            row["batch_no"],
+            row["spec_model"] or "",
+            row["yield_strength"],
+            row["tensile_strength"],
+            row["elongation"],
+            row["reduction_area"],
+            hardness_1,
+            hardness_2,
+            hardness_3,
+            row["impact_test"],
+            row["seq_no"] or None,
+            row["supplier_hardness"] or None,
+            row["material_no"] or "",
+            row["remark"] or None,
+            row["material"] or None,
+            updated_by,
+        ),
+    )
+    return {**row, "id": inserted_id, "updated_by": updated_by}
+
+
 def _sync_legacy_record(order_no: str, heat_no: str, batch_no: str, updated_by: str, material_no: str = "") -> dict:
     if not _normalize_str(heat_no) or not _normalize_str(batch_no):
         return _empty_record(order_no, heat_no, batch_no, material_no)
@@ -489,6 +643,7 @@ class TrialSaveRequest(BaseModel):
     batch_no: str = ""
     updated_by: str
     rows: list[dict] = Field(default_factory=list)
+    confirm_update_indices: list[int] = Field(default_factory=list)
 
 
 class TrialDeleteRequest(BaseModel):
@@ -623,6 +778,19 @@ def save_trial_records(req: TrialSaveRequest):
     target_batch_no = _normalize_str(req.batch_no) or next((_normalize_str(row.get("batch_no", "")) for row in req.rows if _normalize_str(row.get("batch_no", ""))), "")
     if not target_heat_no or not target_batch_no:
         raise HTTPException(status_code=400, detail="炉号/热处理批号不能为空")
+
+    normalized_rows: list[dict] = []
+    for raw_row in req.rows:
+        normalized_rows.append(_normalize_trial_row(raw_row, target_heat_no, target_batch_no))
+
+    seen_keys: dict[tuple[str, str, str, str], int] = {}
+    for idx, row in enumerate(normalized_rows):
+        key = _trial_business_key(row)
+        if key in seen_keys:
+            label = _trial_key_label(key)
+            raise HTTPException(status_code=400, detail=f"提交数据中存在重复记录：{label}")
+        seen_keys[key] = idx
+
     existing_rows = fetch_all(
         """
         SELECT * FROM heat_treatment_trial_records
@@ -631,89 +799,113 @@ def save_trial_records(req: TrialSaveRequest):
         """,
         (target_heat_no, target_batch_no),
     )
-    existing_by_id = {int(row["id"]): row for row in existing_rows if row.get("id") is not None}
-    saved_rows: list[dict] = []
-    for raw_row in req.rows:
-        row = _normalize_trial_row(raw_row, target_heat_no, target_batch_no)
-        hardness_1, hardness_2, hardness_3 = _split_hardness(row["hardness"])
+    existing_by_id: dict[int, dict] = {
+        int(row["id"]): row for row in existing_rows if row.get("id") is not None
+    }
+    existing_by_key: dict[tuple[str, str, str, str], dict] = {
+        _trial_business_key(row): row for row in existing_rows
+    }
+
+    for row in normalized_rows:
         row_id = int(row["id"]) if row.get("id") else None
-        if row_id and row_id in existing_by_id:
-            before = _trial_row_to_payload(existing_by_id[row_id])
-            after = {**row, "id": row_id, "updated_by": req.updated_by}
-            execute(
-                """
-                UPDATE heat_treatment_trial_records
-                SET test_date=%s, heat_no=%s, batch_no=%s, spec_model=%s,
-                    mech_yield_strength=%s, mech_tensile_strength=%s, mech_elongation=%s, mech_reduction_area=%s,
-                    mech_hardness_1=%s, mech_hardness_2=%s, mech_hardness_3=%s, mech_impact_test=%s,
-                    seq_no=%s, supplier_hardness=%s, material_no=%s, remark=%s, material=%s,
-                    updated_by=%s, updated_at=NOW()
-                WHERE id=%s
-                """,
-                (
-                    row["test_date"] or None,
-                    row["heat_no"],
-                    row["batch_no"],
-                    row["spec_model"] or None,
-                    row["yield_strength"],
-                    row["tensile_strength"],
-                    row["elongation"],
-                    row["reduction_area"],
-                    hardness_1,
-                    hardness_2,
-                    hardness_3,
-                    row["impact_test"],
-                    row["seq_no"] or None,
-                    row["supplier_hardness"] or None,
-                    row["material_no"] or None,
-                    row["remark"] or None,
-                    row["material"] or None,
-                    req.updated_by,
-                    row_id,
-                ),
-            )
-            saved_rows.append({**row, "id": row_id, "updated_by": req.updated_by})
-            if before != {**after, "updated_at": before.get("updated_at", "")}:
-                _append_log_line(
-                    f"heat_trial_change_{datetime.now().strftime('%Y-%m-%d')}.log",
-                    (
-                        f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} "
-                        f"heat_no={target_heat_no} batch_no={target_batch_no} row_id={row_id} "
-                        f"{_json_diff_line(before, after)}\n"
-                    ),
+        if row_id and row_id not in existing_by_id:
+            db_row = fetch_one("SELECT * FROM heat_treatment_trial_records WHERE id=%s LIMIT 1", (row_id,))
+            if db_row:
+                existing_by_id[row_id] = db_row
+                key = _trial_business_key(db_row)
+                if key not in existing_by_key:
+                    existing_by_key[key] = db_row
+
+    confirm_set = set(req.confirm_update_indices)
+    id_mismatch_indexes: list[int] = []
+    unchanged_items: list[dict] = []
+    confirm_items: list[dict] = []
+    planned_actions: list[tuple[str, dict, int | None, int]] = []
+
+    for idx, row in enumerate(normalized_rows):
+        key = _trial_business_key(row)
+        key_label = _trial_key_label(key)
+        row_id = int(row["id"]) if row.get("id") else None
+        existing_for_key = existing_by_key.get(key)
+
+        if row_id:
+            db_row = existing_by_id.get(row_id)
+            if db_row and _trial_business_key(db_row) == key:
+                planned_actions.append(("update", row, row_id, idx))
+                continue
+            if db_row and _trial_business_key(db_row) != key:
+                id_mismatch_indexes.append(idx)
+                continue
+            if existing_for_key:
+                if _trial_content_equal(row, existing_for_key):
+                    unchanged_items.append({"index": idx, "label": key_label})
+                elif idx not in confirm_set:
+                    confirm_items.append(
+                        {
+                            "index": idx,
+                            "label": key_label,
+                            "existing_id": int(existing_for_key["id"]),
+                        }
+                    )
+                else:
+                    planned_actions.append(("update", row, int(existing_for_key["id"]), idx))
+                continue
+            planned_actions.append(("insert", row, None, idx))
+            continue
+
+        if existing_for_key:
+            if _trial_content_equal(row, existing_for_key):
+                unchanged_items.append({"index": idx, "label": key_label})
+            elif idx not in confirm_set:
+                confirm_items.append(
+                    {
+                        "index": idx,
+                        "label": key_label,
+                        "existing_id": int(existing_for_key["id"]),
+                    }
                 )
+            else:
+                planned_actions.append(("update", row, int(existing_for_key["id"]), idx))
+            continue
+
+        planned_actions.append(("insert", row, None, idx))
+
+    if id_mismatch_indexes:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "message": "id重复，请删除该行信息确认后重新提交",
+                "code": "id_mismatch",
+                "row_indexes": id_mismatch_indexes,
+            },
+        )
+
+    if unchanged_items:
+        labels = "、".join(item["label"] for item in unchanged_items)
+        return {
+            "status": "unchanged",
+            "message": f"已存在 {labels} 的数据，无数据更新",
+            "unchanged": unchanged_items,
+        }
+
+    if confirm_items:
+        labels = "、".join(item["label"] for item in confirm_items)
+        return {
+            "status": "confirm_required",
+            "message": f"已存在 {labels} 的数据，是否更新该条数据的试验记录？",
+            "conflicts": confirm_items,
+        }
+
+    saved_rows: list[dict] = []
+    for action, row, row_id, source_index in planned_actions:
+        if action == "update" and row_id is not None:
+            saved = _execute_trial_update(row, row_id, req.updated_by, existing_by_id)
+        elif action == "insert":
+            saved = _execute_trial_insert(row, req.updated_by)
         else:
-            inserted_id = execute(
-                """
-                INSERT INTO heat_treatment_trial_records (
-                    test_date, heat_no, batch_no, spec_model,
-                    mech_yield_strength, mech_tensile_strength, mech_elongation, mech_reduction_area,
-                    mech_hardness_1, mech_hardness_2, mech_hardness_3, mech_impact_test,
-                    seq_no, supplier_hardness, material_no, remark, material, updated_by
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                """,
-                (
-                    row["test_date"] or None,
-                    row["heat_no"],
-                    row["batch_no"],
-                    row["spec_model"] or None,
-                    row["yield_strength"],
-                    row["tensile_strength"],
-                    row["elongation"],
-                    row["reduction_area"],
-                    hardness_1,
-                    hardness_2,
-                    hardness_3,
-                    row["impact_test"],
-                    row["seq_no"] or None,
-                    row["supplier_hardness"] or None,
-                    row["material_no"] or None,
-                    row["remark"] or None,
-                    row["material"] or None,
-                    req.updated_by,
-                ),
-            )
-            saved_rows.append({**row, "id": inserted_id, "updated_by": req.updated_by})
+            continue
+        saved_rows.append({**saved, "index": source_index})
+
     return {
         "status": "success",
         "saved_count": len(saved_rows),

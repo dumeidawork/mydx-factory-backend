@@ -942,6 +942,8 @@ ORDER_DETAIL_WRITABLE_FIELDS = frozenset(
         "quantity",
         "unit_weight",
         "total_weight",
+        "agreement_price",
+        "product_unit_price",
         "remark1",
         "remark2",
         "heat_no",
@@ -951,6 +953,13 @@ ORDER_DETAIL_WRITABLE_FIELDS = frozenset(
         "material_mode",
     }
 )
+
+_ORDER_DETAIL_SELECT_COLUMNS = """
+        id, order_no, customer, factory_order_no, seq, item_no, name, drawing_no, material_no, spec_model, spec, standard,
+        material, quantity, unit_weight, total_weight, agreement_price, product_unit_price, remark1, remark2,
+        heat_no, heat_treatment_batch_no, order_status, doc_status, upload_type, material_mode,
+        started_at, finished_at, packed_at, shipped_at, created_at, updated_at
+"""
 
 
 def _serialize_order_detail_patch(patch: dict) -> dict[str, Any]:
@@ -969,13 +978,153 @@ def _serialize_order_detail_patch(patch: dict) -> dict[str, Any]:
                 normalized["item_no"] = int(float(value))
         elif key == "quantity":
             normalized["quantity"] = _safe_int(value)
-        elif key in ("unit_weight", "total_weight"):
+        elif key in ("unit_weight", "total_weight", "agreement_price", "product_unit_price"):
             normalized[key] = _safe_float(value)
         elif key == "status":
             normalized["order_status"] = _normalize_str(value)
         else:
             normalized[key] = _normalize_str(value) if isinstance(value, str) else value
     return normalized
+
+
+DOC_STATUS_PENDING = "待补资料"
+
+
+def _ensure_order_details_doc_status_column() -> None:
+    row = fetch_one(
+        """
+        SELECT 1 FROM information_schema.columns
+        WHERE table_schema = DATABASE() AND table_name = 'order_details' AND column_name = 'doc_status'
+        LIMIT 1
+        """
+    )
+    if not row:
+        execute(
+            """
+            ALTER TABLE order_details
+            ADD COLUMN doc_status VARCHAR(32) NOT NULL DEFAULT '' COMMENT '资料状态：空/待补资料'
+            AFTER order_status
+            """
+        )
+
+
+def _ensure_order_details_price_columns() -> None:
+    for column_name, stmt in [
+        (
+            "agreement_price",
+            "ALTER TABLE order_details ADD COLUMN agreement_price DECIMAL(12,2) NOT NULL DEFAULT 0.00 COMMENT '协议价' AFTER total_weight",
+        ),
+        (
+            "product_unit_price",
+            "ALTER TABLE order_details ADD COLUMN product_unit_price DECIMAL(12,2) NOT NULL DEFAULT 0.00 COMMENT '产品单价' AFTER agreement_price",
+        ),
+    ]:
+        row = fetch_one(
+            """
+            SELECT 1 FROM information_schema.columns
+            WHERE table_schema = DATABASE() AND table_name = 'order_details' AND column_name = %s
+            LIMIT 1
+            """,
+            (column_name,),
+        )
+        if not row:
+            execute(stmt)
+
+
+def _drawing_archive_exists(drawing_no: str) -> bool:
+    d_no = _normalize_str(drawing_no)
+    if not d_no:
+        return False
+    try:
+        from app.api.v1.drawing_archives import _ensure_tables as _ensure_drawing_tables
+
+        _ensure_drawing_tables()
+    except Exception:
+        pass
+    row = fetch_one("SELECT id FROM drawing_archives WHERE drawing_no=%s LIMIT 1", (d_no,))
+    return bool(row)
+
+
+def _material_archive_exists(material_no: str, drawing_no: str = "") -> bool:
+    m_no = _normalize_str(material_no)
+    if not m_no:
+        return False
+    try:
+        _ensure_materials_table()
+    except Exception:
+        pass
+    row = fetch_one(
+        """
+        SELECT id FROM materials
+        WHERE material_no=%s AND COALESCE(drawing_no, '')=%s
+        LIMIT 1
+        """,
+        (m_no, _normalize_str(drawing_no)),
+    )
+    return bool(row)
+
+
+def _compute_doc_status(drawing_no: str, material_no: str = "") -> str:
+    """图纸缺失或物料建档缺失 → 待补资料。"""
+    d_no = _normalize_str(drawing_no)
+    m_no = _normalize_str(material_no)
+    if not d_no or not _drawing_archive_exists(d_no):
+        return DOC_STATUS_PENDING
+    if not m_no or not _material_archive_exists(m_no, d_no):
+        return DOC_STATUS_PENDING
+    return ""
+
+
+def _refresh_doc_status_for_order_rows(*, drawing_no: str | None = None, material_no: str | None = None) -> int:
+    """按条件重算订单明细资料状态，返回状态发生变化的行数。"""
+    _ensure_order_details_doc_status_column()
+    _ensure_order_details_loaded()
+    d_filter = _normalize_str(drawing_no) if drawing_no is not None else None
+    m_filter = _normalize_str(material_no) if material_no is not None else None
+    changed = 0
+    for r in order_details:
+        d_no = _normalize_str(r.get("drawing_no", ""))
+        m_no = _normalize_str(r.get("material_no", ""))
+        if d_filter is not None and d_no != d_filter:
+            continue
+        if m_filter is not None and m_no != m_filter:
+            continue
+        next_status = _compute_doc_status(d_no, m_no)
+        prev_status = _normalize_str(r.get("doc_status", ""))
+        if prev_status == next_status:
+            continue
+        execute(
+            "UPDATE order_details SET doc_status=%s, updated_at=NOW() WHERE id=%s",
+            (next_status, int(r["id"])),
+        )
+        r["doc_status"] = next_status
+        changed += 1
+    return changed
+
+
+def clear_pending_doc_status_for_drawing_no(drawing_no: str) -> int:
+    """图纸建档上传后：重算匹配图纸号订单行的资料状态。"""
+    d_no = _normalize_str(drawing_no)
+    if not d_no:
+        return 0
+    return _refresh_doc_status_for_order_rows(drawing_no=d_no)
+
+
+def clear_pending_doc_status_for_material(material_no: str, drawing_no: str = "") -> int:
+    """物料建档完成后：重算匹配物料号(+图纸号)订单行的资料状态。"""
+    m_no = _normalize_str(material_no)
+    if not m_no:
+        return 0
+    d_no = _normalize_str(drawing_no)
+    return _refresh_doc_status_for_order_rows(material_no=m_no, drawing_no=d_no if d_no else None)
+
+
+def mark_pending_doc_status_for_drawing_no(drawing_no: str) -> int:
+    """图纸删除且同号档案已不存在时：重新标记待补资料。"""
+    d_no = _normalize_str(drawing_no)
+    if not d_no:
+        return 0
+    return _refresh_doc_status_for_order_rows(drawing_no=d_no)
 
 
 def _order_detail_cache_from_db(r: dict) -> dict:
@@ -996,11 +1145,14 @@ def _order_detail_cache_from_db(r: dict) -> dict:
         "quantity": int(r.get("quantity", 0) or 0),
         "unit_weight": float(r.get("unit_weight", 0) or 0),
         "total_weight": float(r.get("total_weight", 0) or 0),
+        "agreement_price": float(r.get("agreement_price", 0) or 0),
+        "product_unit_price": float(r.get("product_unit_price", 0) or 0),
         "remark1": r.get("remark1", "") or "",
         "remark2": r.get("remark2", "") or "",
         "heat_no": r.get("heat_no", "") or "",
         "heat_treatment_batch_no": r.get("heat_treatment_batch_no", "") or "",
         "status": r.get("order_status", "") or "",
+        "doc_status": r.get("doc_status", "") or "",
         "upload_type": r.get("upload_type", "") or "",
         "material_mode": r.get("material_mode", "") or "",
         "started_at": str(r.get("started_at") or ""),
@@ -1058,13 +1210,15 @@ def _production_confirm_key(row: dict, order_no: str) -> tuple[int, str, str, in
 
 
 def _ensure_order_details_loaded() -> None:
+    _ensure_order_details_doc_status_column()
+    _ensure_order_details_price_columns()
+    if order_details and ("doc_status" not in order_details[0] or "agreement_price" not in order_details[0]):
+        order_details.clear()
     if order_details:
         return
     rows = fetch_all(
-        """
-        SELECT id, order_no, customer, factory_order_no, seq, item_no, name, drawing_no, material_no, spec_model, spec, standard,
-               material, quantity, unit_weight, total_weight, remark1, remark2, heat_no, heat_treatment_batch_no,
-               order_status, upload_type, material_mode, started_at, finished_at, packed_at, shipped_at, created_at, updated_at
+        f"""
+        SELECT {_ORDER_DETAIL_SELECT_COLUMNS}
         FROM order_details
         ORDER BY id
         """
@@ -1200,17 +1354,172 @@ def _load_materials(material_no: str = "", drawing_no: str = "") -> list[dict]:
     return materials
 
 
+_PACKING_INIT_EXCLUDED_STATUSES = ("开始", "分割", "加工", "再加工")
+_PACKING_KEY_BLOCKED_FIELDS = frozenset({"quantity", "material_no", "item_no"})
+_PACKING_KEY_BLOCK_DETAIL = (
+    "该明细已关联装箱数据，请先在装箱页删除该订单的相关装箱信息后再修改数量/物料号/条目。"
+)
+
+
+def _item_no_key(value: Any) -> int:
+    return normalize_item_no_key(value)
+
+
+def _is_packing_eligible_status(status: str) -> bool:
+    return _normalize_str(status) not in _PACKING_INIT_EXCLUDED_STATUSES
+
+
+def _packing_order_join_sql() -> str:
+    return """
+        LEFT JOIN order_details o
+          ON o.order_no = p.order_no
+         AND o.material_no = p.material_no
+         AND COALESCE(o.item_no, 0) = COALESCE(p.entry_no, 0)
+    """
+
+
+def _count_order_rows_for_packing_key(
+    order_no: str,
+    material_no: str,
+    item_no: Any,
+    *,
+    exclude_id: int | None = None,
+) -> int:
+    sql = """
+        SELECT COUNT(*) AS cnt FROM order_details
+        WHERE order_no=%s AND material_no=%s AND COALESCE(item_no, 0)=%s
+    """
+    params: list[Any] = [order_no, material_no, _item_no_key(item_no)]
+    if exclude_id is not None:
+        sql += " AND id<>%s"
+        params.append(int(exclude_id))
+    row = fetch_one(sql, tuple(params))
+    return int((row or {}).get("cnt") or 0)
+
+
+def _clear_packing_if_key_orphaned(
+    order_no: str,
+    material_no: str,
+    item_no: Any,
+    *,
+    reload: bool = True,
+) -> int:
+    if _count_order_rows_for_packing_key(order_no, material_no, item_no) > 0:
+        return 0
+    rows = fetch_all(
+        """
+        SELECT id FROM packing_details
+        WHERE order_no=%s AND material_no=%s AND COALESCE(entry_no, 0)=%s
+        """,
+        (order_no, material_no, _item_no_key(item_no)),
+    )
+    if not rows:
+        return 0
+    execute_many("DELETE FROM packing_details WHERE id=%s", [(int(r["id"]),) for r in rows])
+    if reload:
+        _reload_packing_details_cache()
+    return len(rows)
+
+
+def _sync_packing_attrs_from_order(after_row: dict) -> None:
+    order_no = after_row.get("order_no", "")
+    material_no = after_row.get("material_no", "")
+    item_key = _item_no_key(after_row.get("item_no"))
+    unit_weight = round(float(after_row.get("unit_weight", 0) or 0), 2)
+    execute(
+        """
+        UPDATE packing_details
+        SET spec=%s, standard=%s, material=%s, remark1=%s, unit_weight=%s,
+            total_weight=ROUND(quantity * %s, 2), updated_at=NOW()
+        WHERE order_no=%s AND material_no=%s AND COALESCE(entry_no, 0)=%s
+        """,
+        (
+            after_row.get("spec", "") or "",
+            after_row.get("standard", "") or "",
+            after_row.get("material", "") or "",
+            after_row.get("remark1", "") or "",
+            unit_weight,
+            unit_weight,
+            order_no,
+            material_no,
+            item_key,
+        ),
+    )
+    _reload_packing_details_cache()
+
+
+def _packing_draft_values_from_order(order_no: str, r: dict) -> tuple[Any, ...]:
+    qty = int(r.get("quantity", 0) or 0)
+    unit_weight = round(float(r.get("unit_weight", 0) or 0), 2)
+    total_weight = round(float(r.get("total_weight", 0) or 0), 2)
+    if not total_weight:
+        total_weight = round(qty * unit_weight, 2)
+    return (
+        order_no,
+        r.get("material_no", "") or "",
+        r.get("spec", "") or "",
+        r.get("standard", "") or "",
+        r.get("material", "") or "",
+        qty,
+        unit_weight,
+        total_weight,
+        0.0,
+        r.get("remark1", "") or "",
+        0,
+        int(r["item_no"]) if r.get("item_no") is not None else None,
+        0,
+        0,
+        0,
+        "",
+        None,
+        None,
+    )
+
+
+_PACKING_INSERT_SQL = """
+    INSERT INTO packing_details (
+        order_no, material_no, spec, standard, material, quantity, unit_weight, total_weight,
+        gross_weight, remark1, box_no, entry_no, box_length, box_width, box_height,
+        packing_remark, delivery_date, packed_at
+    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+"""
+
+
+def _ensure_packing_row_for_order_detail(order_row: dict) -> bool:
+    order_no = order_row.get("order_no", "")
+    if not order_no:
+        return False
+    if not fetch_one("SELECT id FROM packing_details WHERE order_no=%s LIMIT 1", (order_no,)):
+        return False
+    status = order_row.get("status") or order_row.get("order_status") or ""
+    if not _is_packing_eligible_status(str(status)):
+        return False
+    material_no = order_row.get("material_no", "") or ""
+    item_key = _item_no_key(order_row.get("item_no"))
+    if fetch_one(
+        """
+        SELECT id FROM packing_details
+        WHERE order_no=%s AND material_no=%s AND COALESCE(entry_no, 0)=%s
+        LIMIT 1
+        """,
+        (order_no, material_no, item_key),
+    ):
+        return False
+    execute(_PACKING_INSERT_SQL, _packing_draft_values_from_order(order_no, order_row))
+    _reload_packing_details_cache()
+    return True
+
+
 def _ensure_packing_details_loaded() -> None:
     if packing_details:
         return
     rows = fetch_all(
-        """
+        f"""
         SELECT p.id, p.order_no, p.material_no, p.spec, p.standard, p.material, p.quantity, p.unit_weight, p.total_weight,
                p.gross_weight, p.remark1, p.box_no, COALESCE(p.entry_no, o.item_no) AS entry_no, p.box_length, p.box_width, p.box_height,
                p.packing_remark, p.delivery_date, p.packed_at, p.created_at, p.updated_at
         FROM packing_details p
-        LEFT JOIN order_details o
-          ON o.order_no = p.order_no AND o.material_no = p.material_no
+        {_packing_order_join_sql()}
         ORDER BY p.id
         """
     )
@@ -1224,13 +1533,12 @@ def _reload_packing_details_cache() -> None:
 
 def _fetch_packing_rows_from_db(order_no: str) -> list[dict]:
     rows = fetch_all(
-        """
+        f"""
         SELECT p.id, p.order_no, p.material_no, p.spec, p.standard, p.material, p.quantity, p.unit_weight, p.total_weight,
                p.gross_weight, p.remark1, p.box_no, COALESCE(p.entry_no, o.item_no) AS entry_no, p.box_length, p.box_width, p.box_height,
                p.packing_remark, p.delivery_date, p.packed_at, p.created_at, p.updated_at
         FROM packing_details p
-        LEFT JOIN order_details o
-          ON o.order_no = p.order_no AND o.material_no = p.material_no
+        {_packing_order_join_sql()}
         WHERE p.order_no=%s
         ORDER BY p.box_no, COALESCE(p.entry_no, o.item_no, 0), p.id
         """,
@@ -1240,8 +1548,14 @@ def _fetch_packing_rows_from_db(order_no: str) -> list[dict]:
 
 
 def _initialize_packing_rows(order_no: str) -> None:
-    if fetch_one("SELECT id FROM packing_details WHERE order_no=%s LIMIT 1", (order_no,)):
-        return
+    existing = fetch_all(
+        "SELECT material_no, entry_no FROM packing_details WHERE order_no=%s",
+        (order_no,),
+    )
+    existing_keys = {
+        (str(r.get("material_no") or ""), _item_no_key(r.get("entry_no")))
+        for r in existing
+    }
     source_rows = fetch_all(
         """
         SELECT id, material_no, spec, standard, material, quantity, unit_weight, total_weight, remark1, item_no
@@ -1251,40 +1565,16 @@ def _initialize_packing_rows(order_no: str) -> None:
         """,
         (order_no,),
     )
-    if not source_rows:
+    to_insert: list[tuple[Any, ...]] = []
+    for r in source_rows:
+        key = (str(r.get("material_no") or ""), _item_no_key(r.get("item_no")))
+        if key in existing_keys:
+            continue
+        existing_keys.add(key)
+        to_insert.append(_packing_draft_values_from_order(order_no, r))
+    if not to_insert:
         return
-    execute_many(
-        """
-        INSERT INTO packing_details (
-            order_no, material_no, spec, standard, material, quantity, unit_weight, total_weight,
-            gross_weight, remark1, box_no, entry_no, box_length, box_width, box_height,
-            packing_remark, delivery_date, packed_at
-        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-        """,
-        [
-            (
-                order_no,
-                r.get("material_no", ""),
-                r.get("spec", ""),
-                r.get("standard", ""),
-                r.get("material", ""),
-                int(r.get("quantity", 0) or 0),
-                round(float(r.get("unit_weight", 0) or 0), 2),
-                round(float(r.get("total_weight", 0) or 0), 2),
-                0.0,
-                r.get("remark1", ""),
-                0,
-                int(r["item_no"]) if r.get("item_no") is not None else None,
-                0,
-                0,
-                0,
-                "",
-                None,
-                None,
-            )
-            for r in source_rows
-        ],
-    )
+    execute_many(_PACKING_INSERT_SQL, to_insert)
     _reload_packing_details_cache()
 
 
@@ -1409,6 +1699,8 @@ class ManualOrderRow(BaseModel):
     quantity: int = 0
     unit_weight: float = 0
     total_weight: float = 0
+    agreement_price: float = 0
+    product_unit_price: float = 0
     remark1: str = ""
     remark2: str = ""
 
@@ -1582,10 +1874,14 @@ class PackingSaveRequest(BaseModel):
     deleted_ids: list[int] = Field(default_factory=list)
 
 
+class PackingSubmitItem(BaseModel):
+    row_id: int
+    box_no: int
+
+
 class PackingSubmitRequest(BaseModel):
     order_no: str
-    row_ids: list[int]
-    box_no: int
+    items: list[PackingSubmitItem]
     box_length: int
     box_width: int
     box_height: int
@@ -2227,19 +2523,26 @@ def create_manual_order(req: ManualOrderSubmitRequest):
             detail={"message": f"订单号{req.order_no}下序号已存在：{', '.join(map(str, duplicate_existing))}", "errors": []},
         )
     created = []
+    pending_count = 0
     for row in req.rows:
+        doc_status = _compute_doc_status(row.drawing_no, row.material_no)
+        if doc_status == DOC_STATUS_PENDING:
+            pending_count += 1
+        agreement_price = round(float(row.agreement_price or 0), 2)
+        product_unit_price = round(float(row.product_unit_price or 0), 2)
         record_id = execute(
             """
             INSERT INTO order_details (
                 order_no, customer, factory_order_no, seq, item_no, name, drawing_no, material_no, spec_model, spec, standard, material,
-                quantity, unit_weight, total_weight, remark1, remark2, heat_no, heat_treatment_batch_no,
-                order_status, upload_type, material_mode, started_at, finished_at
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                quantity, unit_weight, total_weight, agreement_price, product_unit_price, remark1, remark2, heat_no, heat_treatment_batch_no,
+                order_status, doc_status, upload_type, material_mode, started_at, finished_at
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             """,
             (
                 req.order_no, req.customer, req.factory_order_no, row.seq, row.item_no, row.name, row.drawing_no, row.material_no, row.spec_model, "",
-                "", row.material, row.quantity, round(float(row.unit_weight), 2), round(float(row.total_weight), 2), row.remark1, row.remark2,
-                "", "", "开始", "手动录入", "", now, None
+                "", row.material, row.quantity, round(float(row.unit_weight), 2), round(float(row.total_weight), 2),
+                agreement_price, product_unit_price, row.remark1, row.remark2,
+                "", "", "开始", doc_status, "手动录入", "", now, None
             ),
         )
         record = {
@@ -2259,11 +2562,14 @@ def create_manual_order(req: ManualOrderSubmitRequest):
             "quantity": row.quantity,
             "unit_weight": round(float(row.unit_weight), 2),
             "total_weight": round(float(row.total_weight), 2),
+            "agreement_price": agreement_price,
+            "product_unit_price": product_unit_price,
             "remark1": row.remark1,
             "remark2": row.remark2,
             "heat_no": "",
             "heat_treatment_batch_no": "",
             "status": "开始",
+            "doc_status": doc_status,
             "upload_type": "手动录入",
             "material_mode": "",
             "started_at": now,
@@ -2272,7 +2578,13 @@ def create_manual_order(req: ManualOrderSubmitRequest):
         }
         order_details.append(record)
         created.append(record)
-    return {"status": "success", "order_no": req.order_no, "count": len(created), "rows": created}
+    return {
+        "status": "success",
+        "order_no": req.order_no,
+        "count": len(created),
+        "pending_docs_count": pending_count,
+        "rows": created,
+    }
 
 
 @router.post("/orders/query")
@@ -2316,10 +2628,30 @@ def delete_orders(req: DeleteOrdersRequest):
     target_ids = [order_id for order_id in ids if order_id in existing_ids]
     if not target_ids:
         raise HTTPException(status_code=404, detail="未找到可删除的订单明细")
+    target_id_set = set(target_ids)
+    targets = [r for r in order_details if int(r["id"]) in target_id_set]
+    packing_keys = {
+        (r["order_no"], r["material_no"], _item_no_key(r.get("item_no")))
+        for r in targets
+    }
     execute_many("DELETE FROM order_details WHERE id=%s", [(order_id,) for order_id in target_ids])
-    keep_ids = set(target_ids)
-    order_details[:] = [r for r in order_details if int(r["id"]) not in keep_ids]
-    return {"status": "success", "deleted_count": len(target_ids), "ids": target_ids}
+    order_details[:] = [r for r in order_details if int(r["id"]) not in target_id_set]
+    packing_deleted_count = 0
+    for order_no, material_no, item_key in packing_keys:
+        packing_deleted_count += _clear_packing_if_key_orphaned(
+            order_no,
+            material_no,
+            item_key,
+            reload=False,
+        )
+    if packing_deleted_count:
+        _reload_packing_details_cache()
+    return {
+        "status": "success",
+        "deleted_count": len(target_ids),
+        "ids": target_ids,
+        "packing_deleted_count": packing_deleted_count,
+    }
 
 
 @router.post("/orders/detail/update")
@@ -2332,20 +2664,38 @@ def update_order_detail(req: OrderDetailUpdateRequest):
     if idx is None:
         raise HTTPException(status_code=404, detail="未找到订单明细")
     before_row = dict(order_details[idx])
+    if _has_packing_association_for_detail(before_row):
+        for field in _PACKING_KEY_BLOCKED_FIELDS:
+            if field not in patch_sql:
+                continue
+            before_val = before_row.get(field)
+            after_val = patch_sql.get(field)
+            if field == "item_no":
+                changed = _item_no_key(before_val) != _item_no_key(after_val)
+            elif field == "quantity":
+                changed = int(before_val or 0) != int(after_val or 0)
+            else:
+                changed = _normalize_str(before_val) != _normalize_str(after_val)
+            if changed:
+                raise HTTPException(status_code=400, detail=_PACKING_KEY_BLOCK_DETAIL)
     cols = list(patch_sql.keys())
     sql = "UPDATE order_details SET " + ", ".join(f"{c}=%s" for c in cols) + ", updated_at=NOW() WHERE id=%s"
     execute(sql, tuple(patch_sql[c] for c in cols) + (req.id,))
+    # 图纸号/物料号变更（或任意更新后）按最新值重算资料状态
+    drawing_after = patch_sql.get("drawing_no") if "drawing_no" in patch_sql else before_row.get("drawing_no", "")
+    material_after = patch_sql.get("material_no") if "material_no" in patch_sql else before_row.get("material_no", "")
+    doc_status = _compute_doc_status(str(drawing_after or ""), str(material_after or ""))
+    execute("UPDATE order_details SET doc_status=%s, updated_at=NOW() WHERE id=%s", (doc_status, req.id))
     fresh = fetch_one(
-        """
-        SELECT id, order_no, customer, factory_order_no, seq, item_no, name, drawing_no, material_no, spec_model, spec, standard,
-               material, quantity, unit_weight, total_weight, remark1, remark2, heat_no, heat_treatment_batch_no,
-               order_status, upload_type, material_mode, started_at, finished_at, packed_at, shipped_at, created_at, updated_at
+        f"""
+        SELECT {_ORDER_DETAIL_SELECT_COLUMNS}
         FROM order_details WHERE id=%s
         """,
         (req.id,),
     )
     if fresh:
         order_details[idx] = _order_detail_cache_from_db(fresh)
+    _sync_packing_attrs_from_order(order_details[idx])
     log_payload = {
         "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "action": "update",
@@ -2386,19 +2736,22 @@ def append_order_detail(req: OrderDetailAppendRequest):
     tw_val = float(patch_sql["total_weight"]) if "total_weight" in patch_sql else float(base["total_weight"])
     r1_val = patch_sql.get("remark1") if "remark1" in patch_sql else base["remark1"]
     r2_val = patch_sql.get("remark2") if "remark2" in patch_sql else base["remark2"]
+    agreement_val = float(patch_sql["agreement_price"]) if "agreement_price" in patch_sql else float(base.get("agreement_price", 0) or 0)
+    product_price_val = float(patch_sql["product_unit_price"]) if "product_unit_price" in patch_sql else float(base.get("product_unit_price", 0) or 0)
     heat_val = patch_sql.get("heat_no") if "heat_no" in patch_sql else base["heat_no"]
     batch_val = patch_sql.get("heat_treatment_batch_no") if "heat_treatment_batch_no" in patch_sql else base["heat_treatment_batch_no"]
     status_val = patch_sql.get("order_status") if "order_status" in patch_sql else base["status"]
     upload_val = patch_sql.get("upload_type") if "upload_type" in patch_sql else base["upload_type"]
     mode_val = patch_sql.get("material_mode") if "material_mode" in patch_sql else base["material_mode"]
+    doc_status = _compute_doc_status(str(drawing_val or ""), str(material_no or ""))
     now = now_iso()
     record_id = execute(
         """
         INSERT INTO order_details (
             order_no, customer, factory_order_no, seq, item_no, name, drawing_no, material_no, spec_model, spec, standard, material,
-            quantity, unit_weight, total_weight, remark1, remark2, heat_no, heat_treatment_batch_no,
-            order_status, upload_type, material_mode, started_at, finished_at
-        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            quantity, unit_weight, total_weight, agreement_price, product_unit_price, remark1, remark2, heat_no, heat_treatment_batch_no,
+            order_status, doc_status, upload_type, material_mode, started_at, finished_at
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         """,
         (
             order_no,
@@ -2416,11 +2769,14 @@ def append_order_detail(req: OrderDetailAppendRequest):
             qty_val,
             uw_val,
             tw_val,
+            agreement_val,
+            product_price_val,
             r1_val,
             r2_val,
             heat_val,
             batch_val,
             status_val,
+            doc_status,
             upload_val,
             mode_val,
             now,
@@ -2428,26 +2784,26 @@ def append_order_detail(req: OrderDetailAppendRequest):
         ),
     )
     fresh = fetch_one(
-        """
-        SELECT id, order_no, customer, factory_order_no, seq, item_no, name, drawing_no, material_no, spec_model, spec, standard,
-               material, quantity, unit_weight, total_weight, remark1, remark2, heat_no, heat_treatment_batch_no,
-               order_status, upload_type, material_mode, started_at, finished_at, packed_at, shipped_at, created_at, updated_at
+        f"""
+        SELECT {_ORDER_DETAIL_SELECT_COLUMNS}
         FROM order_details WHERE id=%s
         """,
         (record_id,),
     )
     appended = _order_detail_cache_from_db(fresh) if fresh else {}
     order_details.append(appended)
+    packing_inserted = _ensure_packing_row_for_order_detail(appended) if appended else False
     log_payload = {
         "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "action": "append",
         "based_on_id": req.based_on_id,
         "new_id": record_id,
         "confirm_summary": req.confirm_summary,
+        "packing_inserted": packing_inserted,
         "snapshot": appended,
     }
     _append_log_line(f"order_detail_change_{datetime.now().strftime('%Y-%m-%d')}.log", json.dumps(log_payload, ensure_ascii=False, default=str) + "\n")
-    return {"status": "success", "row": appended}
+    return {"status": "success", "row": appended, "packing_inserted": packing_inserted}
 
 
 @router.post("/orders/split")
@@ -2780,11 +3136,18 @@ def submit_materials(req: MaterialsSaveRequest):
     )
     saved_rows = [_material_row_from_db(r) for r in rows]
     _load_materials()
+    cleared_pending = 0
+    for saved in saved_rows:
+        cleared_pending += clear_pending_doc_status_for_material(
+            str(saved.get("material_no") or ""),
+            str(saved.get("drawing_no") or ""),
+        )
     return {
         "status": "success",
         "saved_count": len(saved_rows),
         "inserted_count": inserted_count,
         "updated_count": updated_count,
+        "cleared_pending_docs_count": cleared_pending,
         "rows": saved_rows,
     }
 
@@ -2792,12 +3155,20 @@ def submit_materials(req: MaterialsSaveRequest):
 @router.delete("/materials/{material_id}")
 def delete_material(material_id: int):
     _ensure_materials_table()
-    existing = fetch_one("SELECT id FROM materials WHERE id=%s", (material_id,))
+    existing = fetch_one(
+        "SELECT id, material_no, drawing_no FROM materials WHERE id=%s",
+        (material_id,),
+    )
     if not existing:
         raise HTTPException(status_code=404, detail="未找到要删除的物料")
+    material_no = _normalize_str(existing.get("material_no", ""))
+    drawing_no = _normalize_str(existing.get("drawing_no", ""))
     execute("DELETE FROM materials WHERE id=%s", (material_id,))
     _load_materials()
-    return {"status": "success", "deleted_id": material_id}
+    marked_pending = 0
+    if material_no:
+        marked_pending = _refresh_doc_status_for_order_rows(material_no=material_no, drawing_no=drawing_no or None)
+    return {"status": "success", "deleted_id": material_id, "marked_pending_docs_count": marked_pending}
 
 
 @router.get("/qc/list")
@@ -3236,8 +3607,12 @@ def update_qc_delivery_qty(
 
 def _has_packing_association_for_detail(row: dict) -> bool:
     packed = fetch_one(
-        "SELECT id FROM packing_details WHERE order_no=%s AND material_no=%s LIMIT 1",
-        (row["order_no"], row["material_no"]),
+        """
+        SELECT id FROM packing_details
+        WHERE order_no=%s AND material_no=%s AND COALESCE(entry_no, 0)=%s
+        LIMIT 1
+        """,
+        (row["order_no"], row["material_no"], _item_no_key(row.get("item_no"))),
     )
     return packed is not None
 
@@ -3264,15 +3639,29 @@ def delete_order_detail(detail_id: int):
     has_packing_association = _has_packing_association_for_detail(row)
     execute("DELETE FROM order_details WHERE id=%s", (detail_id,))
     order_details.pop(idx)
+    packing_deleted_count = _clear_packing_if_key_orphaned(
+        row["order_no"],
+        row["material_no"],
+        row.get("item_no"),
+    )
     log_payload = {
         "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "action": "delete",
         "deleted_id": detail_id,
         "has_packing_association": has_packing_association,
+        "packing_deleted_count": packing_deleted_count,
         "snapshot": row,
     }
     _append_log_line(f"order_detail_change_{datetime.now().strftime('%Y-%m-%d')}.log", json.dumps(log_payload, ensure_ascii=False, default=str) + "\n")
-    return {"status": "success", "deleted_id": detail_id, "message": f"已删除 order_details 表中 id 为 {detail_id} 的 1 条数据"}
+    message = f"已删除 order_details 表中 id 为 {detail_id} 的 1 条数据"
+    if packing_deleted_count:
+        message += f"，并同步清除装箱记录 {packing_deleted_count} 条"
+    return {
+        "status": "success",
+        "deleted_id": detail_id,
+        "packing_deleted_count": packing_deleted_count,
+        "message": message,
+    }
 
 
 @router.post("/qc/save")
@@ -3818,15 +4207,20 @@ def save_packing_rows(req: PackingSaveRequest):
                 ),
             )
 
-    touched_materials = {r.material_no for r in req.rows}
+    touched_keys = {(r.material_no, _item_no_key(r.item_no)) for r in req.rows}
     for row in order_details:
-        if row["order_no"] == req.order_no and row["material_no"] in touched_materials:
+        if row["order_no"] == req.order_no and (row["material_no"], _item_no_key(row.get("item_no"))) in touched_keys:
             row["status"] = "包装"
             row["updated_at"] = now_iso()
-    execute_many(
-        "UPDATE order_details SET order_status=%s, updated_at=NOW() WHERE order_no=%s AND material_no=%s",
-        [("包装", req.order_no, material_no) for material_no in touched_materials],
-    )
+    if touched_keys:
+        execute_many(
+            """
+            UPDATE order_details
+            SET order_status=%s, updated_at=NOW()
+            WHERE order_no=%s AND material_no=%s AND COALESCE(item_no, 0)=%s
+            """,
+            [("包装", req.order_no, material_no, item_key) for material_no, item_key in touched_keys],
+        )
 
     _reload_packing_details_cache()
     saved_rows = _fetch_packing_rows_from_db(req.order_no)
@@ -3867,8 +4261,14 @@ def submit_packing(req: PackingSubmitRequest):
         if not rows:
             raise HTTPException(status_code=404, detail="订单不存在")
         packing_sessions[req.order_no] = {"locked": True, "started_at": now_iso()}
-    target = [r for r in current_rows if int(r["id"]) in req.row_ids]
-    if not target:
+    if not req.items:
+        raise HTTPException(status_code=400, detail="请先勾选要入箱的物料+条目")
+    id_map = {int(r["id"]): r for r in current_rows if r.get("id") is not None}
+    invalid_box = [item.row_id for item in req.items if int(item.box_no) < 1]
+    if invalid_box:
+        raise HTTPException(status_code=400, detail="所选行箱号须为大于0的整数，请先在Step2填写箱号")
+    missing = [item.row_id for item in req.items if int(item.row_id) not in id_map]
+    if missing:
         raise HTTPException(status_code=404, detail="未找到需要装箱提交的条目，请先保存Step2数据")
 
     now = now_iso()
@@ -3880,22 +4280,22 @@ def submit_packing(req: PackingSubmitRequest):
         """,
         [
             (
-                req.box_no,
+                int(item.box_no),
                 req.box_length,
                 req.box_width,
                 req.box_height,
                 req.packing_remark,
                 round(float(req.gross_weight), 2),
                 now,
-                int(rec["id"]),
+                int(item.row_id),
             )
-            for rec in target
+            for item in req.items
         ],
     )
 
     _reload_packing_details_cache()
     rows = _fetch_packing_rows_from_db(req.order_no)
-    return {"status": "success", "count": len(target), "rows": [_serialize_packing_row(r) for r in rows]}
+    return {"status": "success", "count": len(req.items), "rows": [_serialize_packing_row(r) for r in rows]}
 
 
 @router.post("/packing/finish")

@@ -17,6 +17,10 @@ class Settings(BaseSettings):
     algorithm: str = "HS256"
     access_token_expire_minutes: int = 60
 
+    # 业务数据根目录（代码外持久盘；合同原件等）。为空则回退到仓库旁 data/。
+    # 现网建议：C:\mingyuan-erp\data
+    erp_data_dir: str = ""
+
     # PDF 转换：docx → pdf（word=MS Word COM | libreoffice | auto）
     pdf_converter: str = "word"
     libreoffice_path: str = ""
