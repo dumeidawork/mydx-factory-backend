@@ -7,9 +7,11 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
+from typing_extensions import Annotated
 
+from app.api.deps import CurrentUser, get_current_user
 from app.core.database import execute, fetch_all, fetch_one
 from app.core.file_log import append_log_line
 from app.core.paths import get_storage_dir
@@ -38,6 +40,13 @@ LOG_DIR.mkdir(parents=True, exist_ok=True)
 
 def _append_log_line(file_name: str, line: str) -> None:
     append_log_line(LOG_DIR, file_name, line)
+
+
+def _operator_name(user: CurrentUser) -> str:
+    name = _normalize_str(user.name) or _normalize_str(user.username)
+    if not name:
+        raise HTTPException(status_code=400, detail="当前登录用户无有效姓名，无法记录更新者")
+    return name
 
 
 def _normalize_str(value: Any) -> str:
@@ -83,6 +92,139 @@ def _parse_number(value: Any, field_name: str) -> float | None:
         raise HTTPException(status_code=400, detail=f"{field_name}必须为数值") from exc
 
 
+IMPACT_TEST_MIN = 27.0
+IMPACT_TEST_MAX = 300.0
+
+
+def _extract_impact_test_values(value: str) -> list[float]:
+    """从冲击标准字符串提取全部数值。
+
+    支持常见录入格式，例如：
+    - T:198,150,141/R:198,146,148
+    - T:42,45,50/R:38,33,46
+    - T:218.182.156/R:221.184.158
+    """
+    return [float(match) for match in re.findall(r"\d+", _normalize_str(value))]
+
+
+def _validate_impact_test(value: str) -> None:
+    numbers = _extract_impact_test_values(value)
+    if not numbers:
+        raise HTTPException(status_code=400, detail="-20℃下冲击标准未识别到有效数值")
+    out_of_range = [number for number in numbers if number < IMPACT_TEST_MIN or number > IMPACT_TEST_MAX]
+    if out_of_range:
+        bad = "、".join(f"{number:g}" for number in out_of_range)
+        raise HTTPException(
+            status_code=400,
+            detail=f"-20℃下冲击标准单个值须在{IMPACT_TEST_MIN:g}～{IMPACT_TEST_MAX:g}之间，超出范围：{bad}",
+        )
+
+
+def _hardness_part_signature(part: Any) -> float | str:
+    text = _normalize_str(part)
+    if not text:
+        return ""
+    try:
+        return float(text)
+    except (TypeError, ValueError):
+        return text
+
+
+def _hardness_signature_from_parts(
+    hardness_1: Any, hardness_2: Any, hardness_3: Any
+) -> tuple[float | str, float | str, float | str]:
+    return (
+        _hardness_part_signature(hardness_1),
+        _hardness_part_signature(hardness_2),
+        _hardness_part_signature(hardness_3),
+    )
+
+
+def _hardness_signature(value: Any) -> tuple[float | str, float | str, float | str]:
+    return _hardness_signature_from_parts(*_split_hardness(value))
+
+
+def _impact_signature(value: Any) -> tuple[float, ...]:
+    return tuple(_extract_impact_test_values(_normalize_str(value)))
+
+
+def _format_hardness_display(value: Any) -> str:
+    return "/".join(part for part in _split_hardness(value) if part)
+
+
+def _collect_duplicate_trial_value_errors(
+    normalized_rows: list[dict],
+    own_ids: dict[int, int | None],
+    db_rows: list[dict],
+) -> list[dict]:
+    hardness_db: dict[tuple[float | str, float | str, float | str], list[int]] = {}
+    impact_db: dict[tuple[float, ...], list[int]] = {}
+    for db_row in db_rows:
+        db_id = int(db_row["id"])
+        hardness_db.setdefault(
+            _hardness_signature_from_parts(
+                db_row.get("mech_hardness_1", ""),
+                db_row.get("mech_hardness_2", ""),
+                db_row.get("mech_hardness_3", ""),
+            ),
+            [],
+        ).append(db_id)
+        impact_db.setdefault(_impact_signature(db_row.get("mech_impact_test", "")), []).append(db_id)
+
+    hardness_incoming: dict[tuple[float | str, float | str, float | str], list[int]] = {}
+    impact_incoming: dict[tuple[float, ...], list[int]] = {}
+    incoming_sigs: list[tuple[int, tuple[float | str, float | str, float | str], tuple[float, ...]]] = []
+    for idx in sorted(own_ids):
+        row = normalized_rows[idx]
+        hardness_sig = _hardness_signature(row.get("hardness", ""))
+        impact_sig = _impact_signature(row.get("impact_test", ""))
+        hardness_incoming.setdefault(hardness_sig, []).append(idx)
+        impact_incoming.setdefault(impact_sig, []).append(idx)
+        incoming_sigs.append((idx, hardness_sig, impact_sig))
+
+    errors: list[dict] = []
+    for idx, hardness_sig, impact_sig in incoming_sigs:
+        own_id = own_ids.get(idx)
+        row = normalized_rows[idx]
+        peer_hardness = [peer for peer in hardness_incoming.get(hardness_sig, []) if peer != idx]
+        other_db_hardness = [db_id for db_id in hardness_db.get(hardness_sig, []) if db_id != own_id]
+        if peer_hardness or other_db_hardness:
+            display = _format_hardness_display(row.get("hardness", ""))
+            errors.append(
+                {
+                    "index": idx,
+                    "field": "hardness",
+                    "message": f"第{idx + 1}行：硬度1/硬度2/硬度3 与已有记录重复（{display}）",
+                }
+            )
+        peer_impact = [peer for peer in impact_incoming.get(impact_sig, []) if peer != idx]
+        other_db_impact = [db_id for db_id in impact_db.get(impact_sig, []) if db_id != own_id]
+        if peer_impact or other_db_impact:
+            errors.append(
+                {
+                    "index": idx,
+                    "field": "impact_test",
+                    "message": f"第{idx + 1}行：-20℃下冲击标准 与已有记录重复",
+                }
+            )
+    return errors
+
+
+def _raise_duplicate_trial_values(errors: list[dict]) -> None:
+    if not errors:
+        return
+    row_indexes = sorted({int(item["index"]) for item in errors})
+    raise HTTPException(
+        status_code=400,
+        detail={
+            "code": "duplicate_trial_values",
+            "message": "\n".join(str(item["message"]) for item in errors),
+            "row_indexes": row_indexes,
+            "errors": errors,
+        },
+    )
+
+
 def _format_failure(label: str, value: float) -> str:
     return f"{label}（{value:g}）"
 
@@ -125,7 +267,7 @@ def _evaluate_result(mechanical: dict, chemical: dict) -> tuple[str, str]:
         hardness = _parse_number(mechanical.get(f"hardness_{idx}"), label)
         if hardness is not None:
             checked_values += 1
-            if hardness < 137 or hardness > 197:
+            if hardness < 137 or hardness > 187:
                 failures.append(_format_failure(label, hardness))
 
     for scope_key, scope_label in (("raw", "原材"), ("self", "自检")):
@@ -614,6 +756,7 @@ def _normalize_trial_row(row: dict, fallback_heat_no: str, fallback_batch_no: st
         ("reduction_area", "Z标准"),
     ):
         _parse_number(normalized[key], label)
+    _validate_impact_test(normalized["impact_test"])
     return normalized
 
 
@@ -641,7 +784,8 @@ class TrialSaveRequest(BaseModel):
     order_no: str = ""
     heat_no: str = ""
     batch_no: str = ""
-    updated_by: str
+    # 兼容旧客户端；实际更新者以后端登录用户为准
+    updated_by: str = ""
     rows: list[dict] = Field(default_factory=list)
     confirm_update_indices: list[int] = Field(default_factory=list)
 
@@ -658,7 +802,8 @@ class ChemicalSaveRequest(BaseModel):
     order_no: str = ""
     heat_no: str = ""
     batch_no: str = ""
-    updated_by: str
+    # 兼容旧客户端；实际更新者以后端登录用户为准
+    updated_by: str = ""
     raw: dict = Field(default_factory=dict)
     self: dict = Field(default_factory=dict)
 
@@ -771,9 +916,11 @@ def query_trial_records(req: TrialQueryRequest):
 
 
 @router.post("/trial/save")
-def save_trial_records(req: TrialSaveRequest):
-    if not _normalize_str(req.updated_by):
-        raise HTTPException(status_code=400, detail="更新者不能为空")
+def save_trial_records(
+    req: TrialSaveRequest,
+    user: Annotated[CurrentUser, Depends(get_current_user)],
+):
+    updated_by = _operator_name(user)
     target_heat_no = _normalize_str(req.heat_no) or next((_normalize_str(row.get("heat_no", "")) for row in req.rows if _normalize_str(row.get("heat_no", ""))), "")
     target_batch_no = _normalize_str(req.batch_no) or next((_normalize_str(row.get("batch_no", "")) for row in req.rows if _normalize_str(row.get("batch_no", ""))), "")
     if not target_heat_no or not target_batch_no:
@@ -880,6 +1027,25 @@ def save_trial_records(req: TrialSaveRequest):
             },
         )
 
+    own_ids: dict[int, int | None] = {}
+    for _action, _row, row_id, source_index in planned_actions:
+        own_ids[source_index] = row_id
+    for item in unchanged_items:
+        existing = existing_by_key.get(_trial_business_key(normalized_rows[item["index"]]))
+        own_ids[item["index"]] = int(existing["id"]) if existing and existing.get("id") is not None else None
+    for item in confirm_items:
+        own_ids[item["index"]] = int(item["existing_id"])
+    if own_ids:
+        all_value_rows = fetch_all(
+            """
+            SELECT id, mech_hardness_1, mech_hardness_2, mech_hardness_3, mech_impact_test
+            FROM heat_treatment_trial_records
+            """
+        )
+        _raise_duplicate_trial_values(
+            _collect_duplicate_trial_value_errors(normalized_rows, own_ids, all_value_rows)
+        )
+
     if unchanged_items:
         labels = "、".join(item["label"] for item in unchanged_items)
         return {
@@ -899,9 +1065,9 @@ def save_trial_records(req: TrialSaveRequest):
     saved_rows: list[dict] = []
     for action, row, row_id, source_index in planned_actions:
         if action == "update" and row_id is not None:
-            saved = _execute_trial_update(row, row_id, req.updated_by, existing_by_id)
+            saved = _execute_trial_update(row, row_id, updated_by, existing_by_id)
         elif action == "insert":
-            saved = _execute_trial_insert(row, req.updated_by)
+            saved = _execute_trial_insert(row, updated_by)
         else:
             continue
         saved_rows.append({**saved, "index": source_index})
@@ -945,9 +1111,11 @@ def query_chemical_record(req: ChemicalQueryRequest):
 
 
 @router.post("/chemical/save")
-def save_chemical_record(req: ChemicalSaveRequest):
-    if not _normalize_str(req.updated_by):
-        raise HTTPException(status_code=400, detail="更新者不能为空")
+def save_chemical_record(
+    req: ChemicalSaveRequest,
+    user: Annotated[CurrentUser, Depends(get_current_user)],
+):
+    updated_by = _operator_name(user)
     if not _normalize_str(req.heat_no):
         raise HTTPException(status_code=400, detail="炉号不能为空")
     normalized_raw = {key: _round_three(req.raw.get(key, "")) for key in CHEM_KEYS if key != "CEQ"}
@@ -990,7 +1158,7 @@ def save_chemical_record(req: ChemicalSaveRequest):
                 normalized_self["Mo"],
                 normalized_self["V"],
                 normalized_self["CEQ"],
-                req.updated_by,
+                updated_by,
                 int(existing["id"]),
             ),
         )
@@ -998,7 +1166,7 @@ def save_chemical_record(req: ChemicalSaveRequest):
             "heat_no": req.heat_no,
             "raw": {key: "" if normalized_raw[key] is None else normalized_raw[key] for key in CHEM_KEYS},
             "self": {key: "" if normalized_self[key] is None else normalized_self[key] for key in CHEM_KEYS},
-            "updated_by": req.updated_by,
+            "updated_by": updated_by,
         }
         _append_log_line(
             f"heat_chemical_change_{datetime.now().strftime('%Y-%m-%d')}.log",
@@ -1046,10 +1214,10 @@ def save_chemical_record(req: ChemicalSaveRequest):
                 normalized_self["Mo"],
                 normalized_self["V"],
                 normalized_self["CEQ"],
-                req.updated_by,
+                updated_by,
             ),
         )
-    legacy_record = _sync_legacy_record(req.order_no, req.heat_no, req.batch_no, req.updated_by)
+    legacy_record = _sync_legacy_record(req.order_no, req.heat_no, req.batch_no, updated_by)
     row = fetch_one(
         """
         SELECT * FROM heat_treatment_chemical_records
@@ -1102,8 +1270,11 @@ def query_result(req: ResultQueryRequest):
 
 
 @router.post("/result/submit")
-def submit_result(req: ResultSubmitRequest):
-    record = _sync_legacy_record(req.order_no, req.heat_no, req.batch_no, req.updated_by, req.material_no)
+def submit_result(
+    req: ResultSubmitRequest,
+    user: Annotated[CurrentUser, Depends(get_current_user)],
+):
+    record = _sync_legacy_record(req.order_no, req.heat_no, req.batch_no, _operator_name(user), req.material_no)
     return {"status": "success", "record": record}
 
 
@@ -1151,13 +1322,15 @@ def query_result_for_material_row(req: ResultMaterialQueryRequest):
 
 
 @router.post("/result/sync-row")
-def sync_result_row(req: ResultSyncRowRequest):
+def sync_result_row(
+    req: ResultSyncRowRequest,
+    user: Annotated[CurrentUser, Depends(get_current_user)],
+):
     hn = _normalize_str(req.heat_no)
     bn = _normalize_str(req.batch_no)
     if not hn or not bn:
         raise HTTPException(status_code=400, detail="炉号和热处理批号不能为空")
-    updater = _normalize_str(req.updated_by) or "热处理页面刷新"
-    record = _sync_legacy_record(req.order_no, hn, bn, updater, req.material_no)
+    record = _sync_legacy_record(req.order_no, hn, bn, _operator_name(user), req.material_no)
     return {"status": "success", "record": record, "chemical_missing": bool(record.get("chemical_missing"))}
 
 

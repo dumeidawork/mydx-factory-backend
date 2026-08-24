@@ -59,46 +59,61 @@ def main() -> None:
     results: list[dict] = []
 
     def case1_first_alloc_same_day_seq1():
-        r1 = allocate_dalian_certificate(ORDER_A, MAT_A, 10, TEST_DATE)
+        r1 = allocate_dalian_certificate(ORDER_A, MAT_A, 10, TEST_DATE, order_detail_id=1001)
         assert r1["is_reused"] is False
         assert r1["certificate_no"].startswith("ZYXMZ260613-")
         return {
-            "scenario": "同日首次分配（订单A / 物料A / 条目10）",
-            "input": {"order_no": ORDER_A, "material_no": MAT_A, "item_no": 10, "date": TEST_DATE},
+            "scenario": "同日首次分配（按 order_detail_id）",
+            "input": {
+                "order_detail_id": 1001,
+                "order_no": ORDER_A,
+                "material_no": MAT_A,
+                "item_no": 10,
+                "date": TEST_DATE,
+            },
             "certificate_no": r1["certificate_no"],
             "cert_daily_seq": r1["cert_daily_seq"],
             "is_reused": r1["is_reused"],
         }
 
     def case2_second_key_same_day_increments():
-        r1 = allocate_dalian_certificate(ORDER_A, MAT_A, 10, TEST_DATE)
-        r2 = allocate_dalian_certificate(ORDER_B, MAT_B, 20, TEST_DATE)
+        r1 = allocate_dalian_certificate(ORDER_A, MAT_A, 10, TEST_DATE, order_detail_id=1001)
+        r_same = allocate_dalian_certificate(ORDER_A, MAT_A, 10, TEST_DATE, order_detail_id=1002)
+        r2 = allocate_dalian_certificate(ORDER_B, MAT_B, 20, TEST_DATE, order_detail_id=2001)
+        assert r_same["is_reused"] is False
+        assert r_same["certificate_no"] != r1["certificate_no"]
         assert r2["is_reused"] is False
-        assert r2["cert_daily_seq"] == r1["cert_daily_seq"] + 1
+        assert r2["cert_daily_seq"] == r1["cert_daily_seq"] + 2
         assert r2["certificate_no"].startswith("ZYXMZ260613-")
         return {
-            "scenario": "同日第二业务键分配（流水递增）",
-            "input": {"order_no": ORDER_B, "material_no": MAT_B, "item_no": 20, "date": TEST_DATE},
+            "scenario": "同物料不同明细独立编号 + 同日流水递增",
+            "input": {
+                "detail_1": 1001,
+                "detail_2_same_material": 1002,
+                "detail_other_order": 2001,
+                "date": TEST_DATE,
+            },
             "certificate_no": r2["certificate_no"],
+            "same_material_other_detail_no": r_same["certificate_no"],
             "cert_daily_seq": r2["cert_daily_seq"],
             "previous_key_seq": r1["cert_daily_seq"],
             "is_reused": r2["is_reused"],
         }
 
     def case3_reuse_and_force_regenerate():
-        first = allocate_dalian_certificate(ORDER_A, MAT_A, 10, TEST_DATE)
-        reused = allocate_dalian_certificate(ORDER_A, MAT_A, 10, TEST_DATE)
+        first = allocate_dalian_certificate(ORDER_A, MAT_A, 10, TEST_DATE, order_detail_id=1001)
+        reused = allocate_dalian_certificate(ORDER_A, MAT_A, 10, TEST_DATE, order_detail_id=1001)
         assert reused["is_reused"] is True
         assert reused["certificate_no"] == first["certificate_no"]
         regenerated = allocate_dalian_certificate(
-            ORDER_A, MAT_A, 10, TEST_DATE_2, force_regenerate=True
+            ORDER_A, MAT_A, 10, TEST_DATE_2, order_detail_id=1001, force_regenerate=True
         )
         assert regenerated["is_regenerated"] is True
         assert regenerated["certificate_no"] != first["certificate_no"]
         assert regenerated["cert_date_yymmdd"] == "260614"
         assert regenerated["previous_certificate_no"] == first["certificate_no"]
         return {
-            "scenario": "同键复用 + 改日期强制换号",
+            "scenario": "同 order_detail_id 复用 + 改日期强制换号",
             "first_certificate_no": first["certificate_no"],
             "reused_certificate_no": reused["certificate_no"],
             "reused_is_reused": reused["is_reused"],

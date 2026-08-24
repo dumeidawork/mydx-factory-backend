@@ -25,8 +25,16 @@ def _is_dalian_record(base_info: dict) -> bool:
 
 
 def main() -> None:
-    rows = fetch_all("SELECT id, order_no, material_no, base_info, delivery_content, item_no_key, cert_date_yymmdd, cert_daily_seq FROM qc_records ORDER BY id")
-    business_best: dict[tuple[str, str, int], dict] = {}
+    rows = fetch_all(
+        """
+        SELECT id, order_no, material_no, order_detail_id, base_info, delivery_content,
+               item_no_key, cert_date_yymmdd, cert_daily_seq
+        FROM qc_records
+        ORDER BY id
+        """
+    )
+    # 优先按 order_detail_id；无明细 ID 时回退旧三元组
+    business_best: dict[tuple, dict] = {}
     daily_max: dict[str, int] = defaultdict(int)
 
     for row in rows:
@@ -52,11 +60,19 @@ def main() -> None:
             continue
 
         daily_max[yymmdd] = max(daily_max[yymmdd], seq)
-        key = (row["order_no"], row["material_no"], int(item_no_key))
+        detail_id = row.get("order_detail_id")
+        if detail_id is not None:
+            key: tuple = ("detail", int(detail_id))
+        else:
+            key = ("legacy", row["order_no"], row["material_no"], int(item_no_key))
         current = business_best.get(key)
         if current is None or int(row["id"]) < int(current["record_id"]):
             business_best[key] = {
                 "record_id": int(row["id"]),
+                "order_detail_id": int(detail_id) if detail_id is not None else None,
+                "order_no": row["order_no"],
+                "material_no": row["material_no"],
+                "item_no_key": int(item_no_key),
                 "certificate_no": cert_no,
                 "cert_date_yymmdd": yymmdd,
                 "cert_daily_seq": seq,
@@ -66,27 +82,41 @@ def main() -> None:
     updated_counters = 0
     with get_db() as conn:
         cursor = conn.cursor(dictionary=True)
-        for (order_no, material_no, item_no_key), payload in business_best.items():
-            cursor.execute(
-                """
-                SELECT id FROM dalian_certificate_allocations
-                WHERE order_no=%s AND material_no=%s AND item_no_key=%s
-                LIMIT 1
-                """,
-                (order_no, material_no, item_no_key),
-            )
+        for _key, payload in business_best.items():
+            detail_id = payload["order_detail_id"]
+            if detail_id is not None:
+                cursor.execute(
+                    """
+                    SELECT id FROM dalian_certificate_allocations
+                    WHERE order_detail_id=%s
+                    LIMIT 1
+                    """,
+                    (detail_id,),
+                )
+            else:
+                cursor.execute(
+                    """
+                    SELECT id FROM dalian_certificate_allocations
+                    WHERE order_no=%s AND material_no=%s AND item_no_key=%s
+                      AND order_detail_id IS NULL
+                    LIMIT 1
+                    """,
+                    (payload["order_no"], payload["material_no"], payload["item_no_key"]),
+                )
             if cursor.fetchone():
                 continue
             cursor.execute(
                 """
                 INSERT INTO dalian_certificate_allocations (
-                    order_no, material_no, item_no_key, certificate_no, cert_date_yymmdd, cert_daily_seq
-                ) VALUES (%s, %s, %s, %s, %s, %s)
+                    order_detail_id, order_no, material_no, item_no_key,
+                    certificate_no, cert_date_yymmdd, cert_daily_seq
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s)
                 """,
                 (
-                    order_no,
-                    material_no,
-                    item_no_key,
+                    detail_id,
+                    payload["order_no"],
+                    payload["material_no"],
+                    payload["item_no_key"],
                     payload["certificate_no"],
                     payload["cert_date_yymmdd"],
                     payload["cert_daily_seq"],
@@ -107,7 +137,18 @@ def main() -> None:
             updated_counters += 1
         cursor.close()
 
-    print(f"Backfill complete: allocations_inserted={inserted_alloc}, daily_counters_touched={updated_counters}, business_keys={len(business_best)}")
+    print(
+        json.dumps(
+            {
+                "status": "success",
+                "inserted_allocations": inserted_alloc,
+                "updated_daily_counters": updated_counters,
+                "business_keys": len(business_best),
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
 
 
 if __name__ == "__main__":

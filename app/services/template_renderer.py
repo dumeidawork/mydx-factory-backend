@@ -4,12 +4,14 @@ from __future__ import annotations
 import re
 import tempfile
 import zipfile
+from copy import copy
 from pathlib import Path
 from typing import Any
 
 from openpyxl import Workbook, load_workbook
 from openpyxl.worksheet.worksheet import Worksheet
 from docx import Document
+from docx.oxml.ns import qn
 
 _LEGACY_OOXML_PREFIX = "http://purl.oclc.org/ooxml/"
 _OOXML_URI_REPLACEMENTS = (
@@ -114,6 +116,55 @@ def _replace_docx_in_tables(doc: Document, mapping: dict[str, Any]) -> None:
                                 _replace_paragraph_text(p, mapping)
 
 
+def _replace_docx_in_story(story, mapping: dict[str, Any]) -> None:
+    for p in story.paragraphs:
+        _replace_paragraph_text(p, mapping)
+    for table in story.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                for p in cell.paragraphs:
+                    _replace_paragraph_text(p, mapping)
+
+
+def _sectpr_ref_types(sect_pr, local_name: str) -> set[str]:
+    types: set[str] = set()
+    if sect_pr is None:
+        return types
+    for el in sect_pr:
+        if el.tag == qn(f"w:{local_name}"):
+            types.add(el.get(qn("w:type")) or "default")
+    return types
+
+
+def _replace_docx_headers_footers(doc: Document, mapping: dict[str, Any]) -> None:
+    """只替换模板里已有的页眉/页脚，避免访问时新建 footer 把单页撑破。"""
+    seen: set[int] = set()
+
+    def visit(story) -> None:
+        part = getattr(story, "part", None)
+        marker = id(part if part is not None else story)
+        if marker in seen:
+            return
+        seen.add(marker)
+        _replace_docx_in_story(story, mapping)
+
+    for section in doc.sections:
+        header_types = _sectpr_ref_types(section._sectPr, "headerReference")
+        footer_types = _sectpr_ref_types(section._sectPr, "footerReference")
+        if header_types:
+            visit(section.header)
+            if "first" in header_types:
+                visit(section.first_page_header)
+            if "even" in header_types:
+                visit(section.even_page_header)
+        if footer_types:
+            visit(section.footer)
+            if "first" in footer_types:
+                visit(section.first_page_footer)
+            if "even" in footer_types:
+                visit(section.even_page_footer)
+
+
 def render_docx_template(
     template_path: Path,
     output_path: Path,
@@ -129,6 +180,7 @@ def render_docx_template(
         doc = Document(str(resolved_path)) if template_path.exists() else Document()
         _replace_docx_in_paragraphs(doc, mapping)
         _replace_docx_in_tables(doc, mapping)
+        _replace_docx_headers_footers(doc, mapping)
         if append_blocks:
             for block in append_blocks:
                 doc.add_paragraph(block)
@@ -168,6 +220,52 @@ def _render_item_row_values(template_values: list[Any], item: dict[str, Any]) ->
     return row_values
 
 
+def _copy_cell_style(source, dest) -> None:
+    dest.font = copy(source.font)
+    dest.border = copy(source.border)
+    dest.fill = copy(source.fill)
+    dest.alignment = copy(source.alignment)
+    dest.number_format = source.number_format
+    dest.protection = copy(source.protection)
+
+
+def _expand_item_template_rows(ws: Worksheet, template_row: int, items: list[dict[str, Any]]) -> None:
+    """在明细模板行下方插入行，复制边框/字体/行高，并把下方合并区整体下移。"""
+    max_col = max(ws.max_column, 1)
+    template_values = [ws.cell(template_row, c).value for c in range(1, max_col + 1)]
+    template_height = ws.row_dimensions[template_row].height
+    extra = len(items) - 1
+    if extra > 0:
+        insert_at = template_row + 1
+        original_merges = [
+            (rng.min_row, rng.min_col, rng.max_row, rng.max_col) for rng in ws.merged_cells.ranges
+        ]
+        original_heights = {idx: ws.row_dimensions[idx].height for idx in range(1, ws.max_row + 1)}
+        for rng in list(ws.merged_cells.ranges):
+            ws.unmerge_cells(str(rng))
+        ws.insert_rows(insert_at, extra)
+        for idx, height in original_heights.items():
+            dest = idx + extra if idx >= insert_at else idx
+            ws.row_dimensions[dest].height = height
+        for min_row, min_col, max_row, max_col in original_merges:
+            if min_row >= insert_at:
+                min_row += extra
+                max_row += extra
+            elif max_row >= insert_at:
+                max_row += extra
+            ws.merge_cells(start_row=min_row, start_column=min_col, end_row=max_row, end_column=max_col)
+        for offset in range(1, extra + 1):
+            dest_row = template_row + offset
+            ws.row_dimensions[dest_row].height = template_height
+            for col in range(1, max_col + 1):
+                _copy_cell_style(ws.cell(template_row, col), ws.cell(dest_row, col))
+    for index, item in enumerate(items):
+        values = _render_item_row_values(template_values, item)
+        dest_row = template_row + index
+        for col, value in enumerate(values, start=1):
+            ws.cell(dest_row, col).value = value
+
+
 def render_xlsx_template(
     template_path: Path,
     output_path: Path,
@@ -182,15 +280,7 @@ def render_xlsx_template(
     item_template_row = _find_item_template_row(ws)
     if items:
         if item_template_row:
-            template_values = [ws.cell(item_template_row, c).value for c in range(1, ws.max_column + 1)]
-            ws.delete_rows(item_template_row, 1)
-            insert_at = item_template_row
-            for item in items:
-                ws.insert_rows(insert_at, 1)
-                values = _render_item_row_values(template_values, item)
-                for c, v in enumerate(values, start=1):
-                    ws.cell(insert_at, c).value = v
-                insert_at += 1
+            _expand_item_template_rows(ws, item_template_row, items)
         else:
             # 没有item占位行则追加标准表格
             start_row = ws.max_row + 2

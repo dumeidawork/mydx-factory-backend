@@ -1,4 +1,4 @@
-"""质保书快照：按业务五元组 UPSERT 已签发质保书完整数据。"""
+"""质保书快照：按业务六元组（order_detail_id + 五元组）UPSERT 已签发质保书完整数据。"""
 from __future__ import annotations
 
 import json
@@ -14,10 +14,24 @@ def _normalize_str(value: Any) -> str:
     return str(value).strip()
 
 
+def _parse_optional_int(value: Any) -> int | None:
+    if value in (None, ""):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def snapshot_business_key_from_row(row: dict) -> dict[str, Any]:
-    """从 order_details 行或快照行提取业务五元组。"""
+    """从 order_details 行或快照行提取业务六元组（含 order_details.id）。"""
     item_no = row.get("item_no")
+    # 快照行优先 order_detail_id；订单明细行用主键 id
+    detail_id = _parse_optional_int(row.get("order_detail_id"))
+    if detail_id is None:
+        detail_id = _parse_optional_int(row.get("id"))
     return {
+        "order_detail_id": detail_id,
         "order_no": _normalize_str(row.get("order_no", "")),
         "material_no": _normalize_str(row.get("material_no", "")),
         "item_no": item_no if item_no not in (None, "") else None,
@@ -28,13 +42,14 @@ def snapshot_business_key_from_row(row: dict) -> dict[str, Any]:
 
 
 def snapshot_business_key_from_record(record: dict) -> dict[str, Any]:
-    """从 qc_records 记录提取业务五元组（delivery_content 可补炉号/批号）。"""
+    """从 qc_records 记录提取业务六元组（delivery_content 可补炉号/批号）。"""
     delivery_rows = record.get("delivery_content") or []
     delivery = delivery_rows[0] if delivery_rows else {}
     item_no = record.get("item_no")
     if item_no in (None, "") and delivery.get("item_no") not in (None, ""):
         item_no = delivery.get("item_no")
     return {
+        "order_detail_id": _parse_optional_int(record.get("order_detail_id")),
         "order_no": _normalize_str(record.get("order_no", "")),
         "material_no": _normalize_str(record.get("material_no", "")),
         "item_no": item_no if item_no not in (None, "") else None,
@@ -57,6 +72,8 @@ def _resolve_certificate_type(record: dict) -> str:
     order_no = _normalize_str(record.get("order_no", ""))
     if order_no.startswith("4"):
         return "dalian"
+    if order_no.startswith("2"):
+        return "france"
     return "france"
 
 
@@ -95,23 +112,44 @@ def upsert_snapshot_from_record(
     detail_id = order_detail_id
     if detail_id is None and record.get("order_detail_id") is not None:
         detail_id = int(record["order_detail_id"])
+    if detail_id is None:
+        detail_id = key.get("order_detail_id")
     rec_id = qc_record_id if qc_record_id is not None else record.get("id")
     path = _normalize_str(certificate_path or record.get("certificate_path", ""))
 
-    existing = fetch_one(
-        """
-        SELECT id FROM qc_certificate_snapshots
-        WHERE order_no=%s AND material_no=%s AND item_no_key=%s
-          AND heat_no=%s AND heat_treatment_batch_no=%s
-        """,
-        (
+    existing = None
+    if detail_id is not None:
+        existing = fetch_one(
+            "SELECT id FROM qc_certificate_snapshots WHERE order_detail_id=%s",
+            (int(detail_id),),
+        )
+    if not existing:
+        five_tuple_params = (
             key["order_no"],
             key["material_no"],
             key["item_no_key"],
             key["heat_no"],
             key["heat_treatment_batch_no"],
-        ),
-    )
+        )
+        if detail_id is not None:
+            existing = fetch_one(
+                """
+                SELECT id FROM qc_certificate_snapshots
+                WHERE order_no=%s AND material_no=%s AND item_no_key=%s
+                  AND heat_no=%s AND heat_treatment_batch_no=%s
+                  AND (order_detail_id IS NULL OR order_detail_id=%s)
+                """,
+                (*five_tuple_params, int(detail_id)),
+            )
+        else:
+            existing = fetch_one(
+                """
+                SELECT id FROM qc_certificate_snapshots
+                WHERE order_no=%s AND material_no=%s AND item_no_key=%s
+                  AND heat_no=%s AND heat_treatment_batch_no=%s
+                """,
+                five_tuple_params,
+            )
 
     if existing:
         execute(
@@ -173,22 +211,42 @@ def upsert_snapshot_from_record(
 
 
 def find_snapshot_for_order_detail(row: dict) -> dict | None:
-    """按 order_details 行业务键查找快照。"""
+    """按 order_details 业务六元组查找快照（优先 order_detail_id）。"""
     key = snapshot_business_key_from_row(row)
-    snap = fetch_one(
-        """
-        SELECT * FROM qc_certificate_snapshots
-        WHERE order_no=%s AND material_no=%s AND item_no_key=%s
-          AND heat_no=%s AND heat_treatment_batch_no=%s
-        """,
-        (
+    detail_id = key.get("order_detail_id")
+    snap = None
+    if detail_id is not None:
+        snap = fetch_one(
+            "SELECT * FROM qc_certificate_snapshots WHERE order_detail_id=%s",
+            (int(detail_id),),
+        )
+    if not snap:
+        five_tuple_params = (
             key["order_no"],
             key["material_no"],
             key["item_no_key"],
             key["heat_no"],
             key["heat_treatment_batch_no"],
-        ),
-    )
+        )
+        if detail_id is not None:
+            snap = fetch_one(
+                """
+                SELECT * FROM qc_certificate_snapshots
+                WHERE order_no=%s AND material_no=%s AND item_no_key=%s
+                  AND heat_no=%s AND heat_treatment_batch_no=%s
+                  AND (order_detail_id IS NULL OR order_detail_id=%s)
+                """,
+                (*five_tuple_params, int(detail_id)),
+            )
+        else:
+            snap = fetch_one(
+                """
+                SELECT * FROM qc_certificate_snapshots
+                WHERE order_no=%s AND material_no=%s AND item_no_key=%s
+                  AND heat_no=%s AND heat_treatment_batch_no=%s
+                """,
+                five_tuple_params,
+            )
     if not snap:
         return None
     return snapshot_row_to_dict(snap)
@@ -257,7 +315,7 @@ def query_snapshots(
     if region_text == "dalian":
         conditions.append(f"{table_prefix}order_no LIKE '4%'")
     elif region_text == "france":
-        conditions.append(f"{table_prefix}order_no NOT LIKE '4%'")
+        conditions.append(f"{table_prefix}order_no LIKE '2%'")
     status_text = _normalize_str(status)
     if status_text:
         conditions.append("od.order_status = %s")

@@ -77,6 +77,14 @@ def get_drawing_archives_dir() -> Path:
 
 
 @lru_cache(maxsize=1)
+def get_warehouse_dir() -> Path:
+    path = get_data_dir() / "warehouse"
+    path.mkdir(parents=True, exist_ok=True)
+    (path / "aux_receipts").mkdir(parents=True, exist_ok=True)
+    return path
+
+
+@lru_cache(maxsize=1)
 def get_storage_dir() -> Path:
     """运行时生成物/日志目录。若已配置 ERP_DATA_DIR，优先使用 data 下子目录以与代码解耦。"""
     data_dir = get_data_dir()

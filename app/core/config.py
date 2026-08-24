@@ -12,6 +12,7 @@ class Settings(BaseSettings):
     mysql_user: str = "root"
     mysql_password: str = "Dmd142357869."
     mysql_database: str = "mingyuan_erp"
+    mysql_pool_size: int = 32
 
     secret_key: str = "change-me-in-production"
     algorithm: str = "HS256"

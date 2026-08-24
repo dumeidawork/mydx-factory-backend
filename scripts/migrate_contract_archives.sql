@@ -16,6 +16,10 @@ CREATE TABLE IF NOT EXISTS customer_contract_archives (
     summary TEXT NULL COMMENT '合同概述',
     owner_user_id INT NULL COMMENT '业务负责人',
     owner_name VARCHAR(64) NULL,
+    progress_status VARCHAR(16) NOT NULL DEFAULT '上传' COMMENT '合同进度：上传/分配/确认/修改',
+    assigned_at DATETIME NULL COMMENT '进入本次分配的时间',
+    total_amount DECIMAL(14,2) NULL COMMENT '合同总金额',
+    previous_total_amount DECIMAL(14,2) NULL COMMENT '修改前合同总金额',
     storage_relative_path VARCHAR(1024) NOT NULL COMMENT '相对 contract_archives 根目录',
     file_size BIGINT NOT NULL DEFAULT 0,
     content_type VARCHAR(128) NULL,
@@ -24,6 +28,7 @@ CREATE TABLE IF NOT EXISTS customer_contract_archives (
     UNIQUE KEY uk_archive_identity (customer_name, file_name, version, upload_date),
     INDEX idx_archive_customer (customer_name),
     INDEX idx_archive_owner (owner_user_id),
+    INDEX idx_archive_owner_progress (owner_user_id, progress_status),
     INDEX idx_archive_upload_date (upload_date),
     INDEX idx_archive_updated_date (updated_date)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='客户原始合同归档';
@@ -31,7 +36,7 @@ CREATE TABLE IF NOT EXISTS customer_contract_archives (
 CREATE TABLE IF NOT EXISTS customer_contract_archive_logs (
     id BIGINT PRIMARY KEY AUTO_INCREMENT,
     archive_id INT NULL,
-    action VARCHAR(32) NOT NULL COMMENT 'create/update_meta/version_update/download/assign_owner/export/delete',
+    action VARCHAR(32) NOT NULL COMMENT 'create/update_meta/version_update/download/assign_owner/confirm_takeover/export/delete',
     operator_user_id INT NULL,
     operator_name VARCHAR(64) NOT NULL DEFAULT '',
     operated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,

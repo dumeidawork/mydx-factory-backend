@@ -23,6 +23,8 @@ CREATE TABLE IF NOT EXISTS users (
     department VARCHAR(64),
     phone VARCHAR(32),
     language_preference VARCHAR(10) DEFAULT 'zh-CN' COMMENT 'zh-CN, en-US, ja-JP',
+    layout_mode VARCHAR(16) NOT NULL DEFAULT 'horizontal' COMMENT 'horizontal, vertical, classic',
+    color_theme VARCHAR(32) NOT NULL DEFAULT 'classic-blue' COMMENT 'user color theme id',
     username VARCHAR(64) UNIQUE,
     password_hash VARCHAR(255),
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -189,10 +191,31 @@ CREATE TABLE IF NOT EXISTS order_details (
     shipped_at DATETIME,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    created_by VARCHAR(64) NULL COMMENT '上传者',
+    created_by_user_id INT NULL COMMENT '上传者用户ID',
+    updated_by VARCHAR(64) NULL COMMENT '更改者',
+    updated_by_user_id INT NULL COMMENT '更改者用户ID',
     INDEX idx_order_no (order_no),
     INDEX idx_material_no (material_no),
     INDEX idx_status (order_status)
 );
+
+CREATE TABLE IF NOT EXISTS order_detail_operation_logs (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    row_id BIGINT NULL COMMENT '订单明细ID，删除后可空',
+    order_no VARCHAR(64) NULL,
+    material_no VARCHAR(128) NULL,
+    action VARCHAR(32) NOT NULL COMMENT 'create/update/upload/export/delete',
+    operator_user_id INT NULL,
+    operator_name VARCHAR(64) NOT NULL DEFAULT '',
+    operated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    change_summary TEXT NULL COMMENT '变更内容 JSON',
+    INDEX idx_od_log_row (row_id),
+    INDEX idx_od_log_order (order_no),
+    INDEX idx_od_log_material (material_no),
+    INDEX idx_od_log_action (action),
+    INDEX idx_od_log_time (operated_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='订单明细操作日志';
 
 -- 装箱明细表
 CREATE TABLE IF NOT EXISTS packing_details (
@@ -245,7 +268,7 @@ CREATE TABLE IF NOT EXISTS qc_records (
 -- 质保书快照表（每条业务数据当前已签发的质保书完整快照）
 CREATE TABLE IF NOT EXISTS qc_certificate_snapshots (
     id INT PRIMARY KEY AUTO_INCREMENT,
-    order_detail_id INT NULL COMMENT '最近生成时关联的订单明细ID',
+    order_detail_id INT NULL COMMENT '订单明细ID（业务唯一键组成部分）',
     order_no VARCHAR(64) NOT NULL,
     material_no VARCHAR(128) NOT NULL,
     item_no INT NULL COMMENT '条目号',
@@ -261,15 +284,16 @@ CREATE TABLE IF NOT EXISTS qc_certificate_snapshots (
     certificate_path VARCHAR(512),
     generated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP COMMENT '首次成功生成时间',
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-    UNIQUE KEY uk_qc_snapshot_business (order_no, material_no, item_no_key, heat_no, heat_treatment_batch_no),
+    UNIQUE KEY uk_qc_snapshot_business (order_detail_id, order_no, material_no, item_no_key, heat_no, heat_treatment_batch_no),
     INDEX idx_qc_snapshot_order (order_no),
     INDEX idx_qc_snapshot_material (material_no),
     INDEX idx_qc_snapshot_detail (order_detail_id)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='质保书快照（按业务五元组唯一）';
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='质保书快照（按业务六元组唯一：order_detail_id+五元组）';
 
--- 大连质保书证书编号分配表（业务键幂等）
+-- 大连质保书证书编号分配表（按 order_detail_id 幂等）
 CREATE TABLE IF NOT EXISTS dalian_certificate_allocations (
     id INT PRIMARY KEY AUTO_INCREMENT,
+    order_detail_id INT NULL COMMENT '订单明细ID，业务唯一键',
     order_no VARCHAR(64) NOT NULL,
     material_no VARCHAR(128) NOT NULL,
     item_no_key INT NOT NULL DEFAULT 0 COMMENT 'COALESCE(item_no,0)',
@@ -278,9 +302,10 @@ CREATE TABLE IF NOT EXISTS dalian_certificate_allocations (
     cert_daily_seq INT NOT NULL,
     first_assigned_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-    UNIQUE KEY uk_dalian_cert_business (order_no, material_no, item_no_key),
+    UNIQUE KEY uk_dalian_cert_business (order_detail_id),
+    INDEX idx_dalian_cert_order_material (order_no, material_no, item_no_key),
     INDEX idx_dalian_cert_date (cert_date_yymmdd)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='大连质保书证书编号分配';
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='大连质保书证书编号分配（按order_detail_id唯一）';
 
 -- 大连质保书按日流水计数器
 CREATE TABLE IF NOT EXISTS dalian_certificate_daily_counters (
@@ -452,6 +477,10 @@ CREATE TABLE IF NOT EXISTS customer_contract_archives (
     summary TEXT NULL COMMENT '合同概述',
     owner_user_id INT NULL COMMENT '业务负责人',
     owner_name VARCHAR(64) NULL,
+    progress_status VARCHAR(16) NOT NULL DEFAULT '上传' COMMENT '合同进度：上传/分配/确认/修改',
+    assigned_at DATETIME NULL COMMENT '进入本次分配的时间',
+    total_amount DECIMAL(14,2) NULL COMMENT '合同总金额',
+    previous_total_amount DECIMAL(14,2) NULL COMMENT '修改前合同总金额',
     storage_relative_path VARCHAR(1024) NOT NULL COMMENT '相对 contract_archives 根目录',
     file_size BIGINT NOT NULL DEFAULT 0,
     content_type VARCHAR(128) NULL,
@@ -460,6 +489,7 @@ CREATE TABLE IF NOT EXISTS customer_contract_archives (
     UNIQUE KEY uk_archive_identity (customer_name, file_name, version, upload_date),
     INDEX idx_archive_customer (customer_name),
     INDEX idx_archive_owner (owner_user_id),
+    INDEX idx_archive_owner_progress (owner_user_id, progress_status),
     INDEX idx_archive_upload_date (upload_date),
     INDEX idx_archive_updated_date (updated_date)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='客户原始合同归档';
@@ -467,7 +497,7 @@ CREATE TABLE IF NOT EXISTS customer_contract_archives (
 CREATE TABLE IF NOT EXISTS customer_contract_archive_logs (
     id BIGINT PRIMARY KEY AUTO_INCREMENT,
     archive_id INT NULL,
-    action VARCHAR(32) NOT NULL COMMENT 'create/update_meta/version_update/download/assign_owner/export/delete',
+    action VARCHAR(32) NOT NULL COMMENT 'create/update_meta/version_update/download/assign_owner/confirm_takeover/export/delete',
     operator_user_id INT NULL,
     operator_name VARCHAR(64) NOT NULL DEFAULT '',
     operated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,

@@ -7,7 +7,16 @@ from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field
 from typing_extensions import Annotated
 
-from app.api.deps import CurrentUser, get_current_user
+from app.api.deps import (
+    COLOR_THEMES,
+    DEFAULT_COLOR_THEME,
+    DEFAULT_LAYOUT_MODE,
+    LAYOUT_MODES,
+    CurrentUser,
+    get_current_user,
+    normalize_color_theme,
+    normalize_layout_mode,
+)
 from app.core.database import execute, fetch_all, fetch_one
 from app.core.security import create_access_token, hash_password, verify_password
 
@@ -16,6 +25,12 @@ router = APIRouter(prefix="/auth", tags=["认证"])
 _USERNAME_RE = re.compile(r"^[A-Za-z0-9_]{3,64}$")
 _MIN_PASSWORD_LEN = 6
 _ADMIN_ROLES = frozenset({"super_admin", "general_manager"})
+_USER_PUBLIC_SELECT = """
+        SELECT u.id, u.name, u.username, u.role_id, u.department, u.language_preference, u.layout_mode, u.color_theme, u.created_at,
+               r.code AS role_code, r.name_zh AS role_name_zh
+        FROM users u
+        LEFT JOIN roles r ON r.id = u.role_id
+"""
 
 
 class LoginRequest(BaseModel):
@@ -51,6 +66,11 @@ class ChangePasswordRequest(BaseModel):
     new_password: str = Field(..., min_length=1)
 
 
+class UpdateMeRequest(BaseModel):
+    layout_mode: str | None = None
+    color_theme: str | None = None
+
+
 def _user_public_dict(row: dict) -> dict:
     return {
         "id": int(row["id"]),
@@ -61,6 +81,8 @@ def _user_public_dict(row: dict) -> dict:
         "role_name_zh": row.get("role_name_zh") or "",
         "department": row.get("department"),
         "language_preference": row.get("language_preference") or "zh-CN",
+        "layout_mode": normalize_layout_mode(row.get("layout_mode")),
+        "color_theme": normalize_color_theme(row.get("color_theme")),
         "created_at": str(row["created_at"]) if row.get("created_at") is not None else None,
     }
 
@@ -72,13 +94,7 @@ def _require_admin(user: CurrentUser) -> None:
 
 def _fetch_user_row(user_id: int) -> dict | None:
     return fetch_one(
-        """
-        SELECT u.id, u.name, u.username, u.role_id, u.department, u.language_preference, u.created_at,
-               r.code AS role_code, r.name_zh AS role_name_zh
-        FROM users u
-        LEFT JOIN roles r ON r.id = u.role_id
-        WHERE u.id = %s
-        """,
+        f"{_USER_PUBLIC_SELECT} WHERE u.id = %s",
         (user_id,),
     )
 
@@ -88,7 +104,7 @@ def login(body: LoginRequest):
     username = body.username.strip()
     row = fetch_one(
         """
-        SELECT u.id, u.name, u.username, u.password_hash, u.role_id, u.department, u.language_preference, u.created_at,
+        SELECT u.id, u.name, u.username, u.password_hash, u.role_id, u.department, u.language_preference, u.layout_mode, u.color_theme, u.created_at,
                r.code AS role_code, r.name_zh AS role_name_zh
         FROM users u
         LEFT JOIN roles r ON r.id = u.role_id
@@ -113,7 +129,45 @@ def get_current_user_info(user: Annotated[CurrentUser, Depends(get_current_user)
         "role_name_zh": user.role_name_zh,
         "department": user.department,
         "language_preference": user.language_preference,
+        "layout_mode": user.layout_mode or DEFAULT_LAYOUT_MODE,
+        "color_theme": user.color_theme or DEFAULT_COLOR_THEME,
     }
+
+
+@router.patch("/me")
+def update_current_user_info(
+    body: UpdateMeRequest,
+    user: Annotated[CurrentUser, Depends(get_current_user)],
+):
+    """已登录用户自助更新个人偏好（布局模式、配色主题）。"""
+    updates: list[str] = []
+    params: list[str | int] = []
+    if body.layout_mode is not None:
+        mode = body.layout_mode.strip()
+        if mode not in LAYOUT_MODES:
+            raise HTTPException(
+                status_code=400,
+                detail=f"layout_mode 仅支持：{', '.join(sorted(LAYOUT_MODES))}",
+            )
+        updates.append("layout_mode=%s")
+        params.append(mode)
+    if body.color_theme is not None:
+        theme = body.color_theme.strip()
+        if theme not in COLOR_THEMES:
+            raise HTTPException(
+                status_code=400,
+                detail=f"color_theme 仅支持：{', '.join(sorted(COLOR_THEMES))}",
+            )
+        updates.append("color_theme=%s")
+        params.append(theme)
+    if not updates:
+        raise HTTPException(status_code=400, detail="未提供可更新字段")
+    params.append(user.id)
+    execute(f"UPDATE users SET {', '.join(updates)} WHERE id=%s", tuple(params))
+    row = _fetch_user_row(user.id)
+    if not row:
+        raise HTTPException(status_code=404, detail="用户不存在")
+    return _user_public_dict(row)
 
 
 @router.post("/change-password")
@@ -188,7 +242,7 @@ def list_users(
     )
     rows = fetch_all(
         f"""
-        SELECT u.id, u.name, u.username, u.role_id, u.department, u.language_preference, u.created_at,
+        SELECT u.id, u.name, u.username, u.role_id, u.department, u.language_preference, u.layout_mode, u.color_theme, u.created_at,
                r.code AS role_code, r.name_zh AS role_name_zh
         FROM users u
         LEFT JOIN roles r ON r.id = u.role_id
@@ -215,7 +269,7 @@ def suggest_users(
         like = f"%{keyword}%"
         rows = fetch_all(
             """
-            SELECT u.id, u.name, u.username, u.role_id, u.department, u.language_preference, u.created_at,
+            SELECT u.id, u.name, u.username, u.role_id, u.department, u.language_preference, u.layout_mode, u.color_theme, u.created_at,
                    r.code AS role_code, r.name_zh AS role_name_zh
             FROM users u
             LEFT JOIN roles r ON r.id = u.role_id
@@ -229,7 +283,7 @@ def suggest_users(
     else:
         rows = fetch_all(
             """
-            SELECT u.id, u.name, u.username, u.role_id, u.department, u.language_preference, u.created_at,
+            SELECT u.id, u.name, u.username, u.role_id, u.department, u.language_preference, u.layout_mode, u.color_theme, u.created_at,
                    r.code AS role_code, r.name_zh AS role_name_zh
             FROM users u
             LEFT JOIN roles r ON r.id = u.role_id

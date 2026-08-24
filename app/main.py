@@ -21,7 +21,7 @@ from app.core.config import get_settings
 from app.core.database import ping_database
 from app.core.file_log import append_log_line
 from app.core.paths import get_storage_dir
-from app.api.v1 import auth, contract_archives, documents, drawing_archives, finance, heat_treatment, operations, workflow
+from app.api.v1 import auth, contract_archives, customer_packing, documents, drawing_archives, finance, heat_treatment, license, operations, price_split, resource_fetch, warehouse, workbench, workflow
 
 settings = get_settings()
 LOG_DIR = get_storage_dir() / "logs"
@@ -121,11 +121,17 @@ async def unhandled_exception_handler(request: Request, exc: Exception):
 app.include_router(finance.router, prefix="/api/v1")
 app.include_router(auth.router, prefix="/api/v1")
 app.include_router(contract_archives.router, prefix="/api/v1")
+app.include_router(customer_packing.router, prefix="/api/v1")
 app.include_router(drawing_archives.router, prefix="/api/v1")
 app.include_router(documents.router, prefix="/api/v1")
 app.include_router(operations.router, prefix="/api/v1")
 app.include_router(workflow.router, prefix="/api/v1")
+app.include_router(price_split.router, prefix="/api/v1")
 app.include_router(heat_treatment.router, prefix="/api/v1")
+app.include_router(license.router, prefix="/api/v1")
+app.include_router(resource_fetch.router, prefix="/api/v1")
+app.include_router(warehouse.router, prefix="/api/v1")
+app.include_router(workbench.router, prefix="/api/v1")
 
 
 @app.get("/")

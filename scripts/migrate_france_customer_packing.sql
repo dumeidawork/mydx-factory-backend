@@ -1,0 +1,77 @@
+-- 法国客户附带箱单：主表 + 明细 + 操作日志
+-- 原件只读取不归档；单头仅记来源文件名
+
+CREATE TABLE IF NOT EXISTS france_customer_packing_lists (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    contract_archive_id INT NOT NULL COMMENT '关联客户合同 id',
+    contract_file_name VARCHAR(255) NOT NULL DEFAULT '' COMMENT '关联合同文件名快照',
+    contract_version VARCHAR(32) NOT NULL DEFAULT '' COMMENT '关联合同版本号快照',
+    departure_date DATE NULL COMMENT '预定离港日 C1',
+    arrival_date DATE NULL COMMENT '预定到港日 C2',
+    source_file_name VARCHAR(255) NOT NULL DEFAULT '' COMMENT '上传时的文件名（不存原件）',
+    amount_checked TINYINT NOT NULL DEFAULT 0 COMMENT '核对总单价是否已确认',
+    amount_checked_at DATETIME NULL COMMENT '核对总单价确认时间',
+    packing_tax_sum DECIMAL(14,2) NULL COMMENT '核对当时的箱单含税合计',
+    contract_total_amount DECIMAL(14,2) NULL COMMENT '核对当时的合同总金额',
+    created_by VARCHAR(64) NULL COMMENT '上传者',
+    created_by_user_id INT NULL COMMENT '上传者用户ID',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP COMMENT '上传时间',
+    updated_by VARCHAR(64) NULL COMMENT '更新者',
+    updated_by_user_id INT NULL COMMENT '更新者用户ID',
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
+    INDEX idx_fcpl_contract (contract_archive_id),
+    INDEX idx_fcpl_departure (departure_date),
+    INDEX idx_fcpl_created_by (created_by_user_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='法国客户附带箱单主表';
+
+CREATE TABLE IF NOT EXISTS france_customer_packing_list_items (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    list_id BIGINT NOT NULL COMMENT '主表 id',
+    seq INT NOT NULL DEFAULT 0 COMMENT '序号',
+    material_no VARCHAR(128) NOT NULL DEFAULT '' COMMENT 'Item 物料号',
+    dn VARCHAR(64) NOT NULL DEFAULT '' COMMENT 'DN 规格',
+    units_per_pallet DECIMAL(12,4) NOT NULL DEFAULT 0 COMMENT 'Unites/Pallets 数量/托',
+    quantity INT NOT NULL DEFAULT 0 COMMENT 'Quantity 订单数量',
+    nb_of_pallets DECIMAL(12,4) NOT NULL DEFAULT 0 COMMENT 'Nb of Pallets 托盘数量',
+    unit_weight DECIMAL(12,2) NOT NULL DEFAULT 0.00 COMMENT 'Unit Weight 单重',
+    total_weight DECIMAL(12,2) NOT NULL DEFAULT 0.00 COMMENT 'Total Weight 总重',
+    po VARCHAR(64) NOT NULL DEFAULT '' COMMENT 'PO 订单号',
+    pos INT NULL COMMENT 'Pos 条目',
+    drawing_no VARCHAR(255) NOT NULL DEFAULT '' COMMENT '图纸号',
+    spec_model VARCHAR(256) NOT NULL DEFAULT '' COMMENT '规格型号',
+    spec VARCHAR(64) NOT NULL DEFAULT '' COMMENT '规格',
+    model VARCHAR(64) NOT NULL DEFAULT '' COMMENT '型号',
+    material VARCHAR(64) NOT NULL DEFAULT '' COMMENT '材质',
+    product_unit_price DECIMAL(12,2) NOT NULL DEFAULT 0.00 COMMENT '产品单价',
+    agreement_price DECIMAL(12,2) NOT NULL DEFAULT 0.00 COMMENT '法国协议价',
+    tax_unit_price DECIMAL(12,2) NOT NULL DEFAULT 0.00 COMMENT '含税单价（保留2位）',
+    tax_total_amount DECIMAL(14,2) NOT NULL DEFAULT 0.00 COMMENT '含税总价（含税单价×数量）',
+    drawing_candidates JSON NULL COMMENT '可选图纸号列表',
+    multi_drawing TINYINT NOT NULL DEFAULT 0 COMMENT '是否存在多个图纸版本',
+    drawing_confirmed TINYINT NOT NULL DEFAULT 0 COMMENT '多版本是否已确认',
+    excel_total_weight DECIMAL(12,2) NULL COMMENT 'Excel G列原值（仅核对）',
+    weight_mismatch TINYINT NOT NULL DEFAULT 0 COMMENT 'Excel总重与单重*数量不一致',
+    match_warning VARCHAR(255) NOT NULL DEFAULT '' COMMENT '回填警告',
+    created_by VARCHAR(64) NULL COMMENT '上传者',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP COMMENT '上传时间',
+    updated_by VARCHAR(64) NULL COMMENT '更新者',
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更新时间',
+    INDEX idx_fcpli_list (list_id),
+    INDEX idx_fcpli_po_pos (po, pos),
+    INDEX idx_fcpli_material (material_no)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='法国客户附带箱单明细';
+
+CREATE TABLE IF NOT EXISTS france_customer_packing_operation_logs (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    list_id BIGINT NULL,
+    item_id BIGINT NULL,
+    action VARCHAR(32) NOT NULL COMMENT 'upload/parse/link_contract/create/update/delete/overwrite/generate_order',
+    operator_user_id INT NULL,
+    operator_name VARCHAR(64) NOT NULL DEFAULT '',
+    operated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    change_summary TEXT NULL COMMENT '变更内容 JSON',
+    INDEX idx_fcpl_log_list (list_id),
+    INDEX idx_fcpl_log_item (item_id),
+    INDEX idx_fcpl_log_action (action),
+    INDEX idx_fcpl_log_time (operated_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='法国客户附带箱单操作日志';

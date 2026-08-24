@@ -12,7 +12,9 @@ import json
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, File, Form, HTTPException, UploadFile
+from typing_extensions import Annotated
+
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse
 from starlette.background import BackgroundTask
 from pydantic import BaseModel, Field
@@ -75,12 +77,28 @@ from app.services.qc_certificate_snapshot import (
     query_snapshots,
     upsert_snapshot_from_record,
 )
+from app.api.deps import CurrentUser, get_current_user
+from app.services.order_detail_audit import (
+    AUDIT_COLUMN_ALTERS,
+    AUDIT_CREATE_COLUMNS,
+    AUDIT_UPDATE_SET,
+    CREATE_LOG_TABLE_SQL as ORDER_DETAIL_LOG_TABLE_SQL,
+    create_audit_values,
+    diff_fields as order_detail_diff_fields,
+    jsonable as order_detail_jsonable,
+    snapshot_keys as order_detail_snapshot,
+    stamp_create,
+    stamp_update,
+    update_audit_values,
+    write_op_log as write_order_detail_op_log,
+)
 from app.api.v1 import heat_treatment as heat_treatment_api
 from app.core.config import get_settings
 from app.core.file_log import append_log_line
 from app.core.paths import get_storage_dir, get_templates_dir
 
 router = APIRouter(prefix="/workflow", tags=["流程实装"])
+UserDep = Annotated[CurrentUser, Depends(get_current_user)]
 
 _STORAGE_DIR = get_storage_dir()
 OUTPUT_DIR = _STORAGE_DIR / "generated"
@@ -530,12 +548,16 @@ def _is_dalian_order_no(order_no: str) -> bool:
     return _normalize_str(order_no).startswith("4")
 
 
+def _is_france_order_no(order_no: str) -> bool:
+    return _normalize_str(order_no).startswith("2")
+
+
 def _filter_qc_rows_by_region(rows: list[dict], region: str) -> list[dict]:
     region_text = _normalize_str(region).lower()
     if region_text == "dalian":
         return [r for r in rows if _is_dalian_order_no(r.get("order_no", ""))]
     if region_text == "france":
-        return [r for r in rows if not _is_dalian_order_no(r.get("order_no", ""))]
+        return [r for r in rows if _is_france_order_no(r.get("order_no", ""))]
     return rows
 
 
@@ -781,11 +803,13 @@ def _resolve_dalian_cert_allocation(
     force_regenerate: bool = False,
 ) -> dict[str, Any]:
     item_no = row.get("item_no")
+    detail_id = int(row["id"]) if row.get("id") is not None else None
     return allocate_dalian_certificate(
         row["order_no"],
         row["material_no"],
         item_no,
         date_text,
+        order_detail_id=detail_id,
         force_regenerate=force_regenerate,
     )
 
@@ -958,7 +982,8 @@ _ORDER_DETAIL_SELECT_COLUMNS = """
         id, order_no, customer, factory_order_no, seq, item_no, name, drawing_no, material_no, spec_model, spec, standard,
         material, quantity, unit_weight, total_weight, agreement_price, product_unit_price, remark1, remark2,
         heat_no, heat_treatment_batch_no, order_status, doc_status, upload_type, material_mode,
-        started_at, finished_at, packed_at, shipped_at, created_at, updated_at
+        started_at, finished_at, packed_at, shipped_at, created_at, updated_at,
+        created_by, created_by_user_id, updated_by, updated_by_user_id
 """
 
 
@@ -1031,17 +1056,47 @@ def _ensure_order_details_price_columns() -> None:
             execute(stmt)
 
 
+def _ensure_order_details_audit() -> None:
+    execute(ORDER_DETAIL_LOG_TABLE_SQL)
+    for column_name, stmt in AUDIT_COLUMN_ALTERS:
+        row = fetch_one(
+            """
+            SELECT 1 FROM information_schema.columns
+            WHERE table_schema = DATABASE() AND table_name = 'order_details' AND column_name = %s
+            LIMIT 1
+            """,
+            (column_name,),
+        )
+        if not row:
+            execute(stmt)
+
+
 def _drawing_archive_exists(drawing_no: str) -> bool:
     d_no = _normalize_str(drawing_no)
     if not d_no:
         return False
     try:
-        from app.api.v1.drawing_archives import _ensure_tables as _ensure_drawing_tables
+        from app.api.v1.drawing_archives import STATUS_REVIEWED, _ensure_tables as _ensure_drawing_tables
+        from app.utils.drawing_no import drawing_no_match_variants
 
         _ensure_drawing_tables()
     except Exception:
-        pass
-    row = fetch_one("SELECT id FROM drawing_archives WHERE drawing_no=%s LIMIT 1", (d_no,))
+        return False
+    variants = drawing_no_match_variants(d_no)
+    if not variants:
+        return False
+    placeholders = ", ".join(["%s"] * len(variants))
+    row = fetch_one(
+        f"""
+        SELECT id FROM drawing_archives
+        WHERE status=%s
+          AND (drawing_no IN ({placeholders})
+               OR standard_no IN ({placeholders})
+               OR drawing_rev_no IN ({placeholders}))
+        LIMIT 1
+        """,
+        (STATUS_REVIEWED, *variants, *variants, *variants),
+    )
     return bool(row)
 
 
@@ -1161,6 +1216,10 @@ def _order_detail_cache_from_db(r: dict) -> dict:
         "shipped_at": str(r.get("shipped_at") or ""),
         "created_at": str(r.get("created_at") or ""),
         "updated_at": str(r.get("updated_at") or ""),
+        "created_by": r.get("created_by", "") or "",
+        "created_by_user_id": int(r["created_by_user_id"]) if r.get("created_by_user_id") is not None else None,
+        "updated_by": r.get("updated_by", "") or "",
+        "updated_by_user_id": int(r["updated_by_user_id"]) if r.get("updated_by_user_id") is not None else None,
     }
 
 
@@ -1212,7 +1271,12 @@ def _production_confirm_key(row: dict, order_no: str) -> tuple[int, str, str, in
 def _ensure_order_details_loaded() -> None:
     _ensure_order_details_doc_status_column()
     _ensure_order_details_price_columns()
-    if order_details and ("doc_status" not in order_details[0] or "agreement_price" not in order_details[0]):
+    _ensure_order_details_audit()
+    if order_details and (
+        "doc_status" not in order_details[0]
+        or "agreement_price" not in order_details[0]
+        or "created_by" not in order_details[0]
+    ):
         order_details.clear()
     if order_details:
         return
@@ -1227,7 +1291,7 @@ def _ensure_order_details_loaded() -> None:
 
 
 _MATERIALS_SELECT_COLUMNS = """
-    id, material_no, part_no, drawing_no, spec_model, material, unit_weight, remark,
+    id, material_no, part_no, drawing_no, standard_no, spec_model, spec, model, material, unit_weight, remark,
     ut, mt, pt, product_unit_price, france_agreement_price, dalian_agreement_price,
     created_by, created_at, updated_by, updated_at
 """
@@ -1268,6 +1332,9 @@ def _ensure_materials_table() -> None:
         ("product_unit_price", "ALTER TABLE materials ADD COLUMN product_unit_price DECIMAL(12,2) NOT NULL DEFAULT 0.00 COMMENT '产品单价' AFTER pt"),
         ("france_agreement_price", "ALTER TABLE materials ADD COLUMN france_agreement_price DECIMAL(12,2) NOT NULL DEFAULT 0.00 COMMENT '法国协议价' AFTER product_unit_price"),
         ("dalian_agreement_price", "ALTER TABLE materials ADD COLUMN dalian_agreement_price DECIMAL(12,2) NOT NULL DEFAULT 0.00 COMMENT '大连协议价' AFTER france_agreement_price"),
+        ("standard_no", "ALTER TABLE materials ADD COLUMN standard_no VARCHAR(255) NOT NULL DEFAULT '' COMMENT '标准号' AFTER drawing_no"),
+        ("spec", "ALTER TABLE materials ADD COLUMN spec VARCHAR(64) NOT NULL DEFAULT '' COMMENT '规格' AFTER spec_model"),
+        ("model", "ALTER TABLE materials ADD COLUMN model VARCHAR(64) NOT NULL DEFAULT '' COMMENT '型号' AFTER spec"),
     ]:
         row = fetch_one(
             """
@@ -1287,7 +1354,10 @@ def _material_row_from_db(row: dict) -> dict:
         "material_no": row.get("material_no", "") or "",
         "part_no": row.get("part_no", "") or "",
         "drawing_no": row.get("drawing_no", "") or "",
+        "standard_no": row.get("standard_no", "") or "",
         "spec_model": row.get("spec_model", "") or "",
+        "spec": row.get("spec", "") or "",
+        "model": row.get("model", "") or "",
         "material": row.get("material", "") or "",
         "unit_weight": float(row.get("unit_weight", 0) or 0),
         "remark": row.get("remark", "") or "",
@@ -1304,21 +1374,28 @@ def _material_row_from_db(row: dict) -> dict:
     }
 
 
-def _material_drawing_key(material_no: str, drawing_no: str) -> tuple[str, str]:
-    return (_normalize_str(material_no), _normalize_str(drawing_no))
+def _material_drawing_key(material_no: str, drawing_no: str, standard_no: str = "") -> tuple[str, str, str]:
+    return (_normalize_str(material_no), _normalize_str(drawing_no), _normalize_str(standard_no))
 
 
-def _find_material_duplicate(material_no: str, drawing_no: str, exclude_id: int | None = None) -> dict | None:
-    key_no, key_drawing = _material_drawing_key(material_no, drawing_no)
+def _find_material_duplicate(
+    material_no: str,
+    drawing_no: str,
+    standard_no: str = "",
+    exclude_id: int | None = None,
+) -> dict | None:
+    key_no, key_drawing, key_standard = _material_drawing_key(material_no, drawing_no, standard_no)
     if not key_no:
         return None
     row = fetch_one(
         """
-        SELECT id, material_no, drawing_no FROM materials
-        WHERE material_no = %s AND COALESCE(drawing_no, '') = %s
+        SELECT id, material_no, drawing_no, standard_no FROM materials
+        WHERE material_no = %s
+          AND COALESCE(drawing_no, '') = %s
+          AND COALESCE(standard_no, '') = %s
         LIMIT 1
         """,
-        (key_no, key_drawing),
+        (key_no, key_drawing, key_standard),
     )
     if not row:
         return None
@@ -1326,6 +1403,68 @@ def _find_material_duplicate(material_no: str, drawing_no: str, exclude_id: int 
     if exclude_id is not None and row_id == int(exclude_id):
         return None
     return row
+
+
+def upsert_material_from_drawing(
+    *,
+    material_no: str,
+    drawing_no: str,
+    standard_no: str,
+    spec: str,
+    model: str,
+    spec_model: str,
+    material: str,
+    unit_weight: float,
+    operator: str,
+) -> str:
+    """图纸上传/修改时同步物料：按物料号+图纸号+标准号插入或覆盖。"""
+    _ensure_materials_table()
+    key_no = _normalize_str(material_no)
+    if not key_no:
+        raise HTTPException(status_code=400, detail="物料号不能为空")
+    key_drawing = _normalize_str(drawing_no)
+    key_standard = _normalize_str(standard_no)
+    existing = _find_material_duplicate(key_no, key_drawing, key_standard)
+    if existing:
+        execute(
+            """
+            UPDATE materials
+            SET spec=%s, model=%s, spec_model=%s, material=%s, unit_weight=%s,
+                updated_by=%s, updated_at=NOW()
+            WHERE id=%s
+            """,
+            (
+                _normalize_str(spec),
+                _normalize_str(model),
+                _normalize_str(spec_model),
+                _normalize_str(material),
+                float(unit_weight or 0),
+                _normalize_str(operator),
+                int(existing["id"]),
+            ),
+        )
+        return "updated"
+    execute(
+        """
+        INSERT INTO materials (
+            material_no, drawing_no, standard_no, spec, model, spec_model, material, unit_weight,
+            created_by, updated_by
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        """,
+        (
+            key_no,
+            key_drawing,
+            key_standard,
+            _normalize_str(spec),
+            _normalize_str(model),
+            _normalize_str(spec_model),
+            _normalize_str(material),
+            float(unit_weight or 0),
+            _normalize_str(operator),
+            _normalize_str(operator),
+        ),
+    )
+    return "inserted"
 
 
 def _load_materials(material_no: str = "", drawing_no: str = "") -> list[dict]:
@@ -1599,16 +1738,9 @@ def _ensure_quality_records_loaded() -> None:
 
 
 def _extract_spec_standard(spec_model: str) -> tuple[str, str]:
-    parts = [p for p in re.split(r"\s+", _normalize_str(spec_model)) if p]
-    spec = ""
-    standard = ""
-    for p in parts:
-        up = p.upper()
-        if not spec and re.match(r"^(DN\d+|\d+NB|\d+A)$", up):
-            spec = up
-        if not standard and re.match(r"^(PN\d+|CL\d+|\d+LB|\d+K)$", up):
-            standard = up
-    return spec, standard
+    from app.utils.spec_parser import extract_spec_standard
+
+    return extract_spec_standard(spec_model)
 
 
 def _status_guard(status: str) -> None:
@@ -1743,6 +1875,13 @@ class OrderDetailAppendRequest(BaseModel):
     confirm_summary: str = ""
 
 
+class OrderExportLogRequest(BaseModel):
+    file_name: str = ""
+    count: int = 0
+    order_nos: list[str] = Field(default_factory=list)
+    material_nos: list[str] = Field(default_factory=list)
+
+
 class ProductionSubmitRequest(BaseModel):
     mode: str = ""
     order_no: str = ""
@@ -1784,6 +1923,15 @@ class MaterialsSaveRequest(BaseModel):
 
 class MaterialsLookupRequest(BaseModel):
     rows: list[dict] = Field(default_factory=list)
+
+
+class MaterialAlignKey(BaseModel):
+    drawing_no: str = ""
+    material_no: str = ""
+
+
+class MaterialAlignConfirmRequest(BaseModel):
+    keys: list[MaterialAlignKey] = Field(default_factory=list)
 
 
 class QcStartRequest(BaseModel):
@@ -2408,6 +2556,7 @@ def get_packing_grouped(order_no: str):
 
 @router.post("/contracts/import")
 async def import_contract_file(
+    user: UserDep,
     order_no: str = Form(...),
     customer: str = Form(...),
     file: UploadFile = File(...),
@@ -2438,17 +2587,17 @@ async def import_contract_file(
     now = now_iso()
     for row in rows:
         record_id = execute(
-            """
+            f"""
             INSERT INTO order_details (
                 order_no, customer, factory_order_no, seq, item_no, name, drawing_no, material_no, spec_model, spec, standard, material,
                 quantity, unit_weight, total_weight, remark1, remark2, heat_no, heat_treatment_batch_no,
-                order_status, upload_type, material_mode, started_at, finished_at
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                order_status, upload_type, material_mode, started_at, finished_at, {AUDIT_CREATE_COLUMNS}
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             """,
             (
                 order_no, customer, "", row["seq"], None, row["name"], row["drawing_no"], row["material_no"], row["spec_model"], "",
                 "", row["material"], row["quantity"], row["unit_weight"], row["total_weight"], row["remark1"], row["remark2"],
-                "", "", "开始", "文件上传", "", now, None
+                "", "", "开始", "文件上传", "", now, None, *create_audit_values(user),
             ),
         )
         record = {
@@ -2479,8 +2628,17 @@ async def import_contract_file(
             "finished_at": "",
             "updated_at": now,
         }
+        stamp_create(record, user)
         order_details.append(record)
         created.append(record)
+        write_order_detail_op_log(
+            action="upload",
+            user=user,
+            row_id=record_id,
+            order_no=order_no,
+            material_no=row["material_no"],
+            change_summary={"op": "upload", "file_name": file.filename, **order_detail_snapshot(record)},
+        )
 
     if temp_file.exists():
         temp_file.unlink()
@@ -2488,7 +2646,7 @@ async def import_contract_file(
 
 
 @router.post("/orders/manual")
-def create_manual_order(req: ManualOrderSubmitRequest):
+def create_manual_order(req: ManualOrderSubmitRequest, user: UserDep):
     _status_guard("开始")
     _upload_type_guard("手动录入")
 
@@ -2531,18 +2689,18 @@ def create_manual_order(req: ManualOrderSubmitRequest):
         agreement_price = round(float(row.agreement_price or 0), 2)
         product_unit_price = round(float(row.product_unit_price or 0), 2)
         record_id = execute(
-            """
+            f"""
             INSERT INTO order_details (
                 order_no, customer, factory_order_no, seq, item_no, name, drawing_no, material_no, spec_model, spec, standard, material,
                 quantity, unit_weight, total_weight, agreement_price, product_unit_price, remark1, remark2, heat_no, heat_treatment_batch_no,
-                order_status, doc_status, upload_type, material_mode, started_at, finished_at
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                order_status, doc_status, upload_type, material_mode, started_at, finished_at, {AUDIT_CREATE_COLUMNS}
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             """,
             (
                 req.order_no, req.customer, req.factory_order_no, row.seq, row.item_no, row.name, row.drawing_no, row.material_no, row.spec_model, "",
                 "", row.material, row.quantity, round(float(row.unit_weight), 2), round(float(row.total_weight), 2),
                 agreement_price, product_unit_price, row.remark1, row.remark2,
-                "", "", "开始", doc_status, "手动录入", "", now, None
+                "", "", "开始", doc_status, "手动录入", "", now, None, *create_audit_values(user),
             ),
         )
         record = {
@@ -2576,8 +2734,17 @@ def create_manual_order(req: ManualOrderSubmitRequest):
             "finished_at": "",
             "updated_at": now,
         }
+        stamp_create(record, user)
         order_details.append(record)
         created.append(record)
+        write_order_detail_op_log(
+            action="create",
+            user=user,
+            row_id=record_id,
+            order_no=req.order_no,
+            material_no=row.material_no,
+            change_summary={"op": "create", **order_detail_snapshot(record)},
+        )
     return {
         "status": "success",
         "order_no": req.order_no,
@@ -2618,8 +2785,73 @@ def query_orders(req: QueryOrdersRequest):
     return {"status": "success", "warning": warning, "total": len(data), "grouped": grouped}
 
 
+@router.get("/orders/logs")
+def list_order_detail_logs(
+    user: UserDep,
+    order_no: str = "",
+    material_no: str = "",
+    action: str = "",
+    row_id: int | None = None,
+    limit: int = Query(200, ge=1, le=500),
+):
+    _ensure_order_details_audit()
+    clauses = ["1=1"]
+    params: list[Any] = []
+    if _normalize_str(order_no):
+        clauses.append("order_no LIKE %s")
+        params.append(f"%{_normalize_str(order_no)}%")
+    if _normalize_str(material_no):
+        clauses.append("material_no LIKE %s")
+        params.append(f"%{_normalize_str(material_no)}%")
+    if _normalize_str(action):
+        clauses.append("action=%s")
+        params.append(_normalize_str(action))
+    if row_id:
+        clauses.append("row_id=%s")
+        params.append(int(row_id))
+    rows = fetch_all(
+        f"""
+        SELECT id, row_id, order_no, material_no, action,
+               operator_user_id, operator_name, operated_at, change_summary
+        FROM order_detail_operation_logs
+        WHERE {' AND '.join(clauses)}
+        ORDER BY id DESC
+        LIMIT %s
+        """,
+        (*params, limit),
+    )
+    data = []
+    for row in rows:
+        item = {k: order_detail_jsonable(v) for k, v in row.items()}
+        item["operator_name"] = _normalize_str(item.get("operator_name"))
+        item["change_summary"] = item.get("change_summary") or ""
+        data.append(item)
+    return {"status": "success", "total": len(data), "rows": data}
+
+
+@router.post("/orders/export-log")
+def log_order_detail_export(req: OrderExportLogRequest, user: UserDep):
+    _ensure_order_details_audit()
+    order_nos = [_normalize_str(x) for x in req.order_nos if _normalize_str(x)]
+    material_nos = [_normalize_str(x) for x in req.material_nos if _normalize_str(x)]
+    write_order_detail_op_log(
+        action="export",
+        user=user,
+        order_no="、".join(order_nos[:8]),
+        material_no=material_nos[0] if material_nos else "",
+        change_summary={
+            "op": "export",
+            "file_name": req.file_name,
+            "count": int(req.count or 0),
+            "order_nos": order_nos,
+            "material_nos": material_nos[:50],
+        },
+    )
+    return {"status": "success"}
+
+
 @router.post("/orders/delete")
-def delete_orders(req: DeleteOrdersRequest):
+def delete_orders(req: DeleteOrdersRequest, user: UserDep):
     _ensure_order_details_loaded()
     ids = sorted({int(x) for x in req.ids if x is not None})
     if not ids:
@@ -2634,6 +2866,15 @@ def delete_orders(req: DeleteOrdersRequest):
         (r["order_no"], r["material_no"], _item_no_key(r.get("item_no")))
         for r in targets
     }
+    for row in targets:
+        write_order_detail_op_log(
+            action="delete",
+            user=user,
+            row_id=int(row["id"]),
+            order_no=str(row.get("order_no") or ""),
+            material_no=str(row.get("material_no") or ""),
+            change_summary={"op": "delete", "snapshot": order_detail_snapshot(row)},
+        )
     execute_many("DELETE FROM order_details WHERE id=%s", [(order_id,) for order_id in target_ids])
     order_details[:] = [r for r in order_details if int(r["id"]) not in target_id_set]
     packing_deleted_count = 0
@@ -2655,7 +2896,7 @@ def delete_orders(req: DeleteOrdersRequest):
 
 
 @router.post("/orders/detail/update")
-def update_order_detail(req: OrderDetailUpdateRequest):
+def update_order_detail(req: OrderDetailUpdateRequest, user: UserDep):
     _ensure_order_details_loaded()
     patch_sql = _serialize_order_detail_patch(req.patch)
     if not patch_sql:
@@ -2679,13 +2920,16 @@ def update_order_detail(req: OrderDetailUpdateRequest):
             if changed:
                 raise HTTPException(status_code=400, detail=_PACKING_KEY_BLOCK_DETAIL)
     cols = list(patch_sql.keys())
-    sql = "UPDATE order_details SET " + ", ".join(f"{c}=%s" for c in cols) + ", updated_at=NOW() WHERE id=%s"
-    execute(sql, tuple(patch_sql[c] for c in cols) + (req.id,))
+    sql = "UPDATE order_details SET " + ", ".join(f"{c}=%s" for c in cols) + f", {AUDIT_UPDATE_SET} WHERE id=%s"
+    execute(sql, tuple(patch_sql[c] for c in cols) + update_audit_values(user) + (req.id,))
     # 图纸号/物料号变更（或任意更新后）按最新值重算资料状态
     drawing_after = patch_sql.get("drawing_no") if "drawing_no" in patch_sql else before_row.get("drawing_no", "")
     material_after = patch_sql.get("material_no") if "material_no" in patch_sql else before_row.get("material_no", "")
     doc_status = _compute_doc_status(str(drawing_after or ""), str(material_after or ""))
-    execute("UPDATE order_details SET doc_status=%s, updated_at=NOW() WHERE id=%s", (doc_status, req.id))
+    execute(
+        f"UPDATE order_details SET doc_status=%s, {AUDIT_UPDATE_SET} WHERE id=%s",
+        (doc_status, *update_audit_values(user), req.id),
+    )
     fresh = fetch_one(
         f"""
         SELECT {_ORDER_DETAIL_SELECT_COLUMNS}
@@ -2696,10 +2940,24 @@ def update_order_detail(req: OrderDetailUpdateRequest):
     if fresh:
         order_details[idx] = _order_detail_cache_from_db(fresh)
     _sync_packing_attrs_from_order(order_details[idx])
+    after_row = dict(order_details[idx])
+    write_order_detail_op_log(
+        action="update",
+        user=user,
+        row_id=req.id,
+        order_no=str(after_row.get("order_no") or ""),
+        material_no=str(after_row.get("material_no") or ""),
+        change_summary={
+            "op": "update",
+            "confirm_summary": req.confirm_summary,
+            "fields": order_detail_diff_fields(before_row, after_row),
+        },
+    )
     log_payload = {
         "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "action": "update",
         "id": req.id,
+        "operator": user.name,
         "before": before_row,
         "patch_applied": patch_sql,
         "confirm_summary": req.confirm_summary,
@@ -2709,7 +2967,7 @@ def update_order_detail(req: OrderDetailUpdateRequest):
 
 
 @router.post("/orders/detail/append")
-def append_order_detail(req: OrderDetailAppendRequest):
+def append_order_detail(req: OrderDetailAppendRequest, user: UserDep):
     _ensure_order_details_loaded()
     base = next((r for r in order_details if int(r["id"]) == req.based_on_id), None)
     if not base:
@@ -2746,12 +3004,12 @@ def append_order_detail(req: OrderDetailAppendRequest):
     doc_status = _compute_doc_status(str(drawing_val or ""), str(material_no or ""))
     now = now_iso()
     record_id = execute(
-        """
+        f"""
         INSERT INTO order_details (
             order_no, customer, factory_order_no, seq, item_no, name, drawing_no, material_no, spec_model, spec, standard, material,
             quantity, unit_weight, total_weight, agreement_price, product_unit_price, remark1, remark2, heat_no, heat_treatment_batch_no,
-            order_status, doc_status, upload_type, material_mode, started_at, finished_at
-        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            order_status, doc_status, upload_type, material_mode, started_at, finished_at, {AUDIT_CREATE_COLUMNS}
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         """,
         (
             order_no,
@@ -2781,6 +3039,7 @@ def append_order_detail(req: OrderDetailAppendRequest):
             mode_val,
             now,
             None,
+            *create_audit_values(user),
         ),
     )
     fresh = fetch_one(
@@ -2793,6 +3052,19 @@ def append_order_detail(req: OrderDetailAppendRequest):
     appended = _order_detail_cache_from_db(fresh) if fresh else {}
     order_details.append(appended)
     packing_inserted = _ensure_packing_row_for_order_detail(appended) if appended else False
+    write_order_detail_op_log(
+        action="create",
+        user=user,
+        row_id=record_id,
+        order_no=str(appended.get("order_no") or order_no),
+        material_no=str(appended.get("material_no") or material_no),
+        change_summary={
+            "op": "append",
+            "based_on_id": req.based_on_id,
+            "confirm_summary": req.confirm_summary,
+            **order_detail_snapshot(appended),
+        },
+    )
     log_payload = {
         "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "action": "append",
@@ -2807,7 +3079,7 @@ def append_order_detail(req: OrderDetailAppendRequest):
 
 
 @router.post("/orders/split")
-def split_order(req: SplitOrderRequest):
+def split_order(req: SplitOrderRequest, user: UserDep):
     _ensure_order_details_loaded()
     _material_mode_guard(req.assign_mode)
     target = [r for r in order_details if r["order_no"] == req.order_no]
@@ -2822,12 +3094,27 @@ def split_order(req: SplitOrderRequest):
 
     now = now_iso()
     for r in target:
+        before = {"material_mode": r.get("material_mode"), "status": r.get("status")}
         r["material_mode"] = req.assign_mode
         r["status"] = "分割"
-        r["updated_at"] = now
+        stamp_update(r, user, now)
+        write_order_detail_op_log(
+            action="update",
+            user=user,
+            row_id=int(r["id"]),
+            order_no=str(r.get("order_no") or ""),
+            material_no=str(r.get("material_no") or ""),
+            change_summary={
+                "op": "split",
+                "fields": {
+                    "material_mode": {"before": before["material_mode"], "after": req.assign_mode},
+                    "status": {"before": before["status"], "after": "分割"},
+                },
+            },
+        )
     execute_many(
-        "UPDATE order_details SET material_mode=%s, order_status=%s, updated_at=NOW() WHERE id=%s",
-        [(req.assign_mode, "分割", int(r["id"])) for r in target],
+        f"UPDATE order_details SET material_mode=%s, order_status=%s, {AUDIT_UPDATE_SET} WHERE id=%s",
+        [(req.assign_mode, "分割", *update_audit_values(user), int(r["id"])) for r in target],
     )
     return {"status": "success", "order_no": req.order_no, "updated_count": len(target), "rows": target}
 
@@ -3020,8 +3307,24 @@ def list_materials(material_no: str = "", drawing_no: str = ""):
     return {"status": "success", "total": len(rows), "rows": rows}
 
 
+@router.post("/materials/align-confirm")
+def confirm_material_align(
+    req: MaterialAlignConfirmRequest,
+    user: Annotated[CurrentUser, Depends(get_current_user)],
+):
+    from app.services.material_align import align_confirm
+
+    return align_confirm(
+        user.id,
+        user.name or user.username,
+        [item.model_dump() for item in req.keys],
+    )
+
+
 @router.post("/materials/lookup")
 def lookup_materials(req: MaterialsLookupRequest):
+    from app.services.material_align import load_order_prices_from_split
+
     _ensure_materials_table()
     result_rows: list[dict] = []
     missing_rows: list[dict] = []
@@ -3047,6 +3350,8 @@ def lookup_materials(req: MaterialsLookupRequest):
             continue
         material_row = _material_row_from_db(row)
         material_row["source_index"] = source_index
+        part_no = _normalize_str(raw.get("part_no", "") or raw.get("name", "") or material_row.get("part_no", ""))
+        material_row.update(load_order_prices_from_split(material_no, drawing_no, part_no))
         result_rows.append(material_row)
     return {"status": "success", "count": len(result_rows), "rows": result_rows, "missing": missing_rows}
 
@@ -3063,20 +3368,27 @@ def submit_materials(req: MaterialsSaveRequest):
         if not material_no:
             raise HTTPException(status_code=400, detail="物料号不能为空")
         drawing_no = _normalize_str(raw.get("drawing_no", ""))
+        standard_no = _normalize_str(raw.get("standard_no", ""))
         unit_weight = _safe_float(raw.get("unit_weight"), 0.0)
         row_id = raw.get("id")
         exclude_id = int(row_id) if row_id else None
-        duplicate = _find_material_duplicate(material_no, drawing_no, exclude_id=exclude_id)
+        duplicate = _find_material_duplicate(material_no, drawing_no, standard_no, exclude_id=exclude_id)
         if duplicate:
             raise HTTPException(
                 status_code=400,
-                detail=f"物料号与图纸号组合已存在（物料号={material_no}，图纸号={drawing_no or '空'}，已有记录 id={duplicate['id']}）",
+                detail=(
+                    f"物料号与图纸号与标准号组合已存在（物料号={material_no}，图纸号={drawing_no or '空'}，"
+                    f"标准号={standard_no or '空'}，已有记录 id={duplicate['id']}）"
+                ),
             )
         payload = (
             material_no,
             _normalize_str(raw.get("part_no", "")),
             drawing_no,
+            standard_no,
             _normalize_str(raw.get("spec_model", "")),
+            _normalize_str(raw.get("spec", "")),
+            _normalize_str(raw.get("model", "")),
             _normalize_str(raw.get("material", "")),
             unit_weight,
             _normalize_str(raw.get("remark", "")),
@@ -3094,7 +3406,8 @@ def submit_materials(req: MaterialsSaveRequest):
                 execute(
                     """
                     UPDATE materials
-                    SET material_no=%s, part_no=%s, drawing_no=%s, spec_model=%s, material=%s,
+                    SET material_no=%s, part_no=%s, drawing_no=%s, standard_no=%s, spec_model=%s,
+                        spec=%s, model=%s, material=%s,
                         unit_weight=%s, remark=%s, ut=%s, mt=%s, pt=%s,
                         product_unit_price=%s, france_agreement_price=%s, dalian_agreement_price=%s,
                         updated_by=%s, updated_at=NOW()
@@ -3108,10 +3421,10 @@ def submit_materials(req: MaterialsSaveRequest):
         new_id = execute(
             """
             INSERT INTO materials (
-                material_no, part_no, drawing_no, spec_model, material, unit_weight, remark,
+                material_no, part_no, drawing_no, standard_no, spec_model, spec, model, material, unit_weight, remark,
                 ut, mt, pt, product_unit_price, france_agreement_price, dalian_agreement_price,
                 created_by, updated_by
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             """,
             (*payload, operator),
         )
@@ -3171,6 +3484,59 @@ def delete_material(material_id: int):
     return {"status": "success", "deleted_id": material_id, "marked_pending_docs_count": marked_pending}
 
 
+def _enrich_qc_list_with_data_missing_flags(rows: list[dict]) -> list[dict]:
+    """为质检列表行附加试验记录 / 化学分析缺失标志（批量查询，避免 N+1）。"""
+    if not rows:
+        return rows
+
+    heat_nos: set[str] = set()
+    for row in rows:
+        heat_no = _normalize_str(row.get("heat_no", ""))
+        if heat_no:
+            heat_nos.add(heat_no)
+
+    existing_trial_keys: set[tuple[str, str]] = set()
+    existing_chemical_heat_nos: set[str] = set()
+    if heat_nos:
+        placeholders = ", ".join(["%s"] * len(heat_nos))
+        heat_no_params = tuple(heat_nos)
+        trial_rows = fetch_all(
+            f"""
+            SELECT DISTINCT heat_no, batch_no
+            FROM heat_treatment_trial_records
+            WHERE heat_no IN ({placeholders})
+            """,
+            heat_no_params,
+        )
+        for tr in trial_rows:
+            hn = _normalize_str(tr.get("heat_no", ""))
+            bn = _normalize_str(tr.get("batch_no", ""))
+            if hn and bn:
+                existing_trial_keys.add((hn, bn))
+        chem_rows = fetch_all(
+            f"""
+            SELECT DISTINCT heat_no
+            FROM heat_treatment_chemical_records
+            WHERE heat_no IN ({placeholders})
+            """,
+            heat_no_params,
+        )
+        for cr in chem_rows:
+            hn = _normalize_str(cr.get("heat_no", ""))
+            if hn:
+                existing_chemical_heat_nos.add(hn)
+
+    enriched: list[dict] = []
+    for row in rows:
+        item = dict(row)
+        heat_no = _normalize_str(item.get("heat_no", ""))
+        batch_no = _normalize_str(item.get("heat_treatment_batch_no", ""))
+        item["trial_data_missing"] = not (heat_no and batch_no and (heat_no, batch_no) in existing_trial_keys)
+        item["chemical_data_missing"] = not (heat_no and heat_no in existing_chemical_heat_nos)
+        enriched.append(item)
+    return enriched
+
+
 @router.get("/qc/list")
 def qc_list(order_no: str = "", material_no: str = "", region: str = "", status: str = ""):
     _ensure_order_details_loaded()
@@ -3187,6 +3553,7 @@ def qc_list(order_no: str = "", material_no: str = "", region: str = "", status:
         target = [r for r in target if material_no.lower() in r["material_no"].lower()]
     target = _filter_qc_rows_by_region(target, region)
     enriched = [enrich_order_detail_with_snapshot(r) for r in target]
+    enriched = _enrich_qc_list_with_data_missing_flags(enriched)
     return {"status": "success", "total": len(enriched), "rows": enriched}
 
 
@@ -3502,6 +3869,7 @@ def allocate_dalian_certificate_no(req: QcDalianAllocateRequest):
         req.material_no,
         item_no,
         req.date,
+        order_detail_id=int(row["id"]),
         force_regenerate=req.force_regenerate,
     )
     return {"status": "success", "cert_allocation": allocation, "certificate_no": allocation["certificate_no"]}
@@ -3532,6 +3900,7 @@ def confirm_dalian_factory_date(req: QcDalianConfirmDateRequest):
             item.material_no,
             item_no,
             req.date,
+            order_detail_id=int(row["id"]),
             force_regenerate=req.force_regenerate,
         )
         results.append(
@@ -3567,6 +3936,7 @@ def update_dalian_certificate_no(req: QcDalianUpdateCertificateNoRequest):
             item_no,
             req.certificate_no,
             req.date,
+            order_detail_id=int(row["id"]),
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -3630,7 +4000,7 @@ def delete_order_detail_check(detail_id: int):
 
 
 @router.delete("/orders/detail/{detail_id}")
-def delete_order_detail(detail_id: int):
+def delete_order_detail(detail_id: int, user: UserDep):
     _ensure_order_details_loaded()
     idx = next((i for i, r in enumerate(order_details) if int(r["id"]) == int(detail_id)), None)
     if idx is None:
@@ -3644,10 +4014,19 @@ def delete_order_detail(detail_id: int):
         row["material_no"],
         row.get("item_no"),
     )
+    write_order_detail_op_log(
+        action="delete",
+        user=user,
+        row_id=detail_id,
+        order_no=str(row.get("order_no") or ""),
+        material_no=str(row.get("material_no") or ""),
+        change_summary={"op": "delete", "snapshot": order_detail_snapshot(row)},
+    )
     log_payload = {
         "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "action": "delete",
         "deleted_id": detail_id,
+        "operator": user.name,
         "has_packing_association": has_packing_association,
         "packing_deleted_count": packing_deleted_count,
         "snapshot": row,
@@ -3695,6 +4074,7 @@ def save_qc(req: QcSaveRequest):
             req.material_no,
             row.get("item_no"),
             date_text,
+            order_detail_id=order_detail_id,
             force_regenerate=False,
         )
         if client_no != allocation["certificate_no"]:
@@ -3705,6 +4085,7 @@ def save_qc(req: QcSaveRequest):
                     row.get("item_no"),
                     client_no,
                     date_text,
+                    order_detail_id=order_detail_id,
                 )
             except ValueError as exc:
                 raise HTTPException(status_code=400, detail=str(exc)) from exc

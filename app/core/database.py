@@ -32,9 +32,11 @@ def get_connection_config() -> dict:
 def _get_pool() -> pooling.MySQLConnectionPool:
     global _pool
     if _pool is None:
+        s = get_settings()
+        pool_size = max(5, min(int(s.mysql_pool_size or 32), 64))
         _pool = pooling.MySQLConnectionPool(
             pool_name="mingyuan_erp",
-            pool_size=10,
+            pool_size=pool_size,
             pool_reset_session=True,
             **get_connection_config(),
         )

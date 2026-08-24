@@ -76,7 +76,12 @@ CHEM_ELEMENT_MAP = {
     "钼 Mo": "Mo",
     "钒 V": "V",
     "碳当量 CEQ": "CEQ",
+    "Σ(Cu+Ni+Cr+Mo+V)": "SUM_CuNiCrMoV",
+    "Σ(Cr+Mo)": "SUM_CrMo",
 }
+
+_SUM_CU_NI_CR_MO_V_KEYS = ("Cu", "Ni", "Cr", "Mo", "V")
+_SUM_CR_MO_KEYS = ("Cr", "Mo")
 
 
 def _norm(v: Any) -> str:
@@ -359,6 +364,31 @@ _CHEM_PLACEHOLDER_SUFFIX = {
 }
 
 
+def _parse_chem_number(value: Any) -> float | None:
+    if value in (None, ""):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _sum_chem_elements(bucket: dict[str, Any], keys: tuple[str, ...]) -> float | str:
+    parsed = [_parse_chem_number(bucket.get(key)) for key in keys]
+    if all(value is None for value in parsed):
+        return ""
+    return round(sum(value or 0 for value in parsed), 3)
+
+
+def _enrich_chem_derived(bucket: Any) -> dict[str, Any]:
+    if not isinstance(bucket, dict):
+        return {}
+    enriched = dict(bucket)
+    enriched["SUM_CuNiCrMoV"] = _sum_chem_elements(bucket, _SUM_CU_NI_CR_MO_V_KEYS)
+    enriched["SUM_CrMo"] = _sum_chem_elements(bucket, _SUM_CR_MO_KEYS)
+    return enriched
+
+
 def _resolve_chem_by_placeholder_key(
     key: str,
     record: dict,
@@ -375,6 +405,7 @@ def _resolve_chem_by_placeholder_key(
         chem_rows = record.get("chemical_analysis") or []
         chem = chem_rows[0] if chem_rows else {}
         bucket = chem.get(kind, {}) if isinstance(chem, dict) else {}
+        bucket = _enrich_chem_derived(bucket)
         return cert_number(bucket.get(element, ""))
     return None
 

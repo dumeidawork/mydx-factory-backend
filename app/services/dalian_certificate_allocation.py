@@ -1,4 +1,4 @@
-"""大连质保书证书编号分配：按 YYMMDD 当日流水递增，业务键幂等复用。"""
+"""大连质保书证书编号分配：按 YYMMDD 当日流水递增，按 order_detail_id 幂等复用。"""
 from __future__ import annotations
 
 import re
@@ -18,6 +18,15 @@ def normalize_item_no_key(item_no: Any) -> int:
         return int(float(item_no))
     except (TypeError, ValueError):
         return 0
+
+
+def parse_optional_order_detail_id(value: Any) -> int | None:
+    if value in (None, ""):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def parse_qc_date_text(date_text: str) -> datetime:
@@ -84,16 +93,47 @@ def _next_daily_seq(cursor, cert_date_yymmdd: str) -> int:
 
 
 def _allocation_row_to_result(row: dict, *, is_reused: bool, is_regenerated: bool = False) -> dict[str, Any]:
+    detail_id = row.get("order_detail_id")
     return {
         "certificate_no": row["certificate_no"],
         "cert_date_yymmdd": row["cert_date_yymmdd"],
         "cert_daily_seq": int(row["cert_daily_seq"]),
         "item_no_key": int(row["item_no_key"]),
+        "order_detail_id": int(detail_id) if detail_id is not None else None,
         "is_reused": is_reused,
         "is_regenerated": is_regenerated,
         "has_date_conflict": False,
         "previous_certificate_no": row["certificate_no"] if is_regenerated else None,
     }
+
+
+def _find_existing_allocation(cursor, order_no: str, material_no: str, item_no_key: int, order_detail_id: int | None):
+    if order_detail_id is not None:
+        cursor.execute(
+            """
+            SELECT id, order_detail_id, order_no, material_no, item_no_key, certificate_no,
+                   cert_date_yymmdd, cert_daily_seq
+            FROM dalian_certificate_allocations
+            WHERE order_detail_id = %s
+            FOR UPDATE
+            """,
+            (int(order_detail_id),),
+        )
+        existing = cursor.fetchone()
+        if existing:
+            return existing
+    cursor.execute(
+        """
+        SELECT id, order_detail_id, order_no, material_no, item_no_key, certificate_no,
+               cert_date_yymmdd, cert_daily_seq
+        FROM dalian_certificate_allocations
+        WHERE order_no = %s AND material_no = %s AND item_no_key = %s
+          AND (order_detail_id IS NULL OR order_detail_id = %s)
+        FOR UPDATE
+        """,
+        (order_no, material_no, item_no_key, order_detail_id),
+    )
+    return cursor.fetchone()
 
 
 def allocate_dalian_certificate(
@@ -102,27 +142,30 @@ def allocate_dalian_certificate(
     item_no: Any,
     date_text: str,
     *,
+    order_detail_id: int | None = None,
     force_regenerate: bool = False,
 ) -> dict[str, Any]:
-    """在事务中分配或复用大连证书编号。"""
+    """在事务中分配或复用大连证书编号（按 order_detail_id 区分）。"""
     item_no_key = normalize_item_no_key(item_no)
+    detail_id = parse_optional_order_detail_id(order_detail_id)
     requested_yymmdd = yymmdd_from_date_text(date_text)
 
     with get_db() as conn:
         cursor = conn.cursor(dictionary=True)
-        cursor.execute(
-            """
-            SELECT id, order_no, material_no, item_no_key, certificate_no,
-                   cert_date_yymmdd, cert_daily_seq
-            FROM dalian_certificate_allocations
-            WHERE order_no = %s AND material_no = %s AND item_no_key = %s
-            FOR UPDATE
-            """,
-            (order_no, material_no, item_no_key),
-        )
-        existing = cursor.fetchone()
+        existing = _find_existing_allocation(cursor, order_no, material_no, item_no_key, detail_id)
 
         if existing and not force_regenerate:
+            # 旧行缺少 order_detail_id 时，补写以便后续按明细区分
+            if detail_id is not None and existing.get("order_detail_id") is None:
+                cursor.execute(
+                    """
+                    UPDATE dalian_certificate_allocations
+                    SET order_detail_id = %s, updated_at = NOW()
+                    WHERE id = %s
+                    """,
+                    (detail_id, existing["id"]),
+                )
+                existing["order_detail_id"] = detail_id
             result = _allocation_row_to_result(existing, is_reused=True)
             result["has_date_conflict"] = existing["cert_date_yymmdd"] != requested_yymmdd
             result["allocated_certificate_no"] = existing["certificate_no"]
@@ -138,13 +181,14 @@ def allocate_dalian_certificate(
             cursor.execute(
                 """
                 UPDATE dalian_certificate_allocations
-                SET certificate_no = %s,
+                SET order_detail_id = COALESCE(%s, order_detail_id),
+                    certificate_no = %s,
                     cert_date_yymmdd = %s,
                     cert_daily_seq = %s,
                     updated_at = NOW()
                 WHERE id = %s
                 """,
-                (certificate_no, requested_yymmdd, daily_seq, existing["id"]),
+                (detail_id, certificate_no, requested_yymmdd, daily_seq, existing["id"]),
             )
             cursor.close()
             return {
@@ -152,6 +196,7 @@ def allocate_dalian_certificate(
                 "cert_date_yymmdd": requested_yymmdd,
                 "cert_daily_seq": daily_seq,
                 "item_no_key": item_no_key,
+                "order_detail_id": detail_id if detail_id is not None else existing.get("order_detail_id"),
                 "is_reused": False,
                 "is_regenerated": True,
                 "has_date_conflict": False,
@@ -163,11 +208,11 @@ def allocate_dalian_certificate(
         cursor.execute(
             """
             INSERT INTO dalian_certificate_allocations (
-                order_no, material_no, item_no_key, certificate_no,
+                order_detail_id, order_no, material_no, item_no_key, certificate_no,
                 cert_date_yymmdd, cert_daily_seq
-            ) VALUES (%s, %s, %s, %s, %s, %s)
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s)
             """,
-            (order_no, material_no, item_no_key, certificate_no, requested_yymmdd, daily_seq),
+            (detail_id, order_no, material_no, item_no_key, certificate_no, requested_yymmdd, daily_seq),
         )
         cursor.close()
         return {
@@ -175,6 +220,7 @@ def allocate_dalian_certificate(
             "cert_date_yymmdd": requested_yymmdd,
             "cert_daily_seq": daily_seq,
             "item_no_key": item_no_key,
+            "order_detail_id": detail_id,
             "is_reused": False,
             "is_regenerated": False,
             "has_date_conflict": False,
@@ -190,6 +236,8 @@ def update_dalian_certificate_allocation(
     item_no: Any,
     certificate_no: str,
     date_text: str,
+    *,
+    order_detail_id: int | None = None,
 ) -> dict[str, Any]:
     """手动更新已分配的大连证书编号（须与出厂日期 YYMMDD 一致）。"""
     parsed = parse_certificate_no(certificate_no)
@@ -200,40 +248,34 @@ def update_dalian_certificate_allocation(
     if cert_date_yymmdd != requested_yymmdd:
         raise ValueError("证书编号中的日期与出厂日期不一致")
     item_no_key = normalize_item_no_key(item_no)
+    detail_id = parse_optional_order_detail_id(order_detail_id)
     normalized_no = format_certificate_no(cert_date_yymmdd, cert_daily_seq)
 
     with get_db() as conn:
         cursor = conn.cursor(dictionary=True)
-        cursor.execute(
-            """
-            SELECT id FROM dalian_certificate_allocations
-            WHERE order_no = %s AND material_no = %s AND item_no_key = %s
-            FOR UPDATE
-            """,
-            (order_no, material_no, item_no_key),
-        )
-        existing = cursor.fetchone()
+        existing = _find_existing_allocation(cursor, order_no, material_no, item_no_key, detail_id)
         if not existing:
             cursor.execute(
                 """
                 INSERT INTO dalian_certificate_allocations (
-                    order_no, material_no, item_no_key, certificate_no,
+                    order_detail_id, order_no, material_no, item_no_key, certificate_no,
                     cert_date_yymmdd, cert_daily_seq
-                ) VALUES (%s, %s, %s, %s, %s, %s)
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s)
                 """,
-                (order_no, material_no, item_no_key, normalized_no, cert_date_yymmdd, cert_daily_seq),
+                (detail_id, order_no, material_no, item_no_key, normalized_no, cert_date_yymmdd, cert_daily_seq),
             )
         else:
             cursor.execute(
                 """
                 UPDATE dalian_certificate_allocations
-                SET certificate_no = %s,
+                SET order_detail_id = COALESCE(%s, order_detail_id),
+                    certificate_no = %s,
                     cert_date_yymmdd = %s,
                     cert_daily_seq = %s,
                     updated_at = NOW()
                 WHERE id = %s
                 """,
-                (normalized_no, cert_date_yymmdd, cert_daily_seq, existing["id"]),
+                (detail_id, normalized_no, cert_date_yymmdd, cert_daily_seq, existing["id"]),
             )
         cursor.close()
 
@@ -242,6 +284,7 @@ def update_dalian_certificate_allocation(
         "cert_date_yymmdd": cert_date_yymmdd,
         "cert_daily_seq": cert_daily_seq,
         "item_no_key": item_no_key,
+        "order_detail_id": detail_id,
         "is_reused": False,
         "is_regenerated": False,
         "has_date_conflict": False,
