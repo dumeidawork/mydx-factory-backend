@@ -1,6 +1,8 @@
 """法国许可证模块 API：预览与生成。"""
 from __future__ import annotations
 
+import base64
+import zipfile
 from datetime import datetime
 from pathlib import Path
 
@@ -15,12 +17,16 @@ from app.api.v1.contract_archives import _absolute_from_relative, _assert_archiv
 from app.core.file_log import append_log_line
 from app.core.paths import get_storage_dir
 from app.services.license_service import (
+    TRANSPORT_AIR,
+    TRANSPORT_SEA,
+    build_bank_invoice_files,
     build_license_zip,
     is_france_order_no,
     normalize_order_no,
     parse_batch_date,
     preview_payload,
 )
+from app.services.shipping_docs_service import build_shipping_doc_files
 
 LOG_DIR = get_storage_dir() / "logs"
 
@@ -33,6 +39,12 @@ class GenerateLicenseRequest(BaseModel):
     pad_item_no: bool = False
     batch_date: str | None = None
     archive_ids: list[int] = Field(default_factory=list)
+
+
+class GenerateBankInvoiceRequest(BaseModel):
+    order_no: str = Field(..., min_length=1)
+    transport: str = Field(..., description="air 或 sea")
+    batch_date: str | None = None
 
 
 def _require_france_order(order_no: str) -> str:
@@ -132,3 +144,93 @@ def generate_license(
         f"{digits}许可证.zip",
         "application/zip",
     )
+
+
+@router.post("/bank-invoice")
+def generate_bank_invoice(
+    body: GenerateBankInvoiceRequest,
+    user: Annotated[CurrentUser, Depends(get_current_user)],
+):
+    del user
+    digits = _require_france_order(body.order_no)
+    transport = str(body.transport or "").strip().lower()
+    if transport not in (TRANSPORT_AIR, TRANSPORT_SEA):
+        raise HTTPException(status_code=400, detail="请选择空运或海运")
+    try:
+        batch_date = parse_batch_date(body.batch_date)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    try:
+        zip_path, file_names = build_bank_invoice_files(
+            order_no=digits,
+            transport=transport,
+            batch_date_value=batch_date,
+        )
+    except FileNotFoundError as exc:
+        append_log_line(
+            LOG_DIR,
+            f"license_{datetime.now().strftime('%Y-%m-%d')}.log",
+            f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} bank-invoice order_no={digits} {exc}",
+        )
+        raise HTTPException(status_code=500, detail="银行发票模板缺失，请联系管理员") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    files: list[dict[str, str]] = []
+    try:
+        with zipfile.ZipFile(zip_path) as zf:
+            for name in file_names:
+                files.append(
+                    {
+                        "file_name": name,
+                        "content_base64": base64.b64encode(zf.read(name)).decode("ascii"),
+                    }
+                )
+    finally:
+        zip_path.unlink(missing_ok=True)
+    return {"files": files}
+
+
+@router.post("/shipping-docs")
+def generate_shipping_docs(
+    body: GenerateBankInvoiceRequest,
+    user: Annotated[CurrentUser, Depends(get_current_user)],
+):
+    del user
+    digits = _require_france_order(body.order_no)
+    transport = str(body.transport or "").strip().lower()
+    if transport not in (TRANSPORT_AIR, TRANSPORT_SEA):
+        raise HTTPException(status_code=400, detail="请选择空运或海运")
+    try:
+        batch_date = parse_batch_date(body.batch_date)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    try:
+        zip_path, file_names = build_shipping_doc_files(
+            order_no=digits,
+            transport=transport,
+            batch_date_value=batch_date,
+        )
+    except FileNotFoundError as exc:
+        append_log_line(
+            LOG_DIR,
+            f"license_{datetime.now().strftime('%Y-%m-%d')}.log",
+            f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} shipping-docs order_no={digits} {exc}",
+        )
+        raise HTTPException(status_code=500, detail="出货资料模板缺失，请联系管理员") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    files: list[dict[str, str]] = []
+    try:
+        with zipfile.ZipFile(zip_path) as zf:
+            for name in file_names:
+                files.append(
+                    {
+                        "file_name": name,
+                        "content_base64": base64.b64encode(zf.read(name)).decode("ascii"),
+                    }
+                )
+    finally:
+        zip_path.unlink(missing_ok=True)
+    return {"files": files}

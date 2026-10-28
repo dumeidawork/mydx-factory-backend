@@ -4,12 +4,13 @@ from __future__ import annotations
 import os
 import re
 import tempfile
+import uuid
 import zipfile
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from fastapi import HTTPException
+from fastapi import HTTPException, UploadFile
 
 from app.api.deps import CurrentUser
 from app.core.database import execute, execute_many, fetch_all, fetch_one
@@ -18,12 +19,27 @@ from app.services.resource_fetch_schema import (
     CREATE_RESOURCE_FETCH_DOWNLOAD_LOGS_SQL,
     CREATE_RESOURCE_FETCH_ROOT_ROLES_SQL,
     CREATE_RESOURCE_FETCH_ROOTS_SQL,
+    CREATE_RESOURCE_FETCH_WRITE_LOGS_SQL,
 )
 
+ADMIN_ROLE_CODES = frozenset({"super_admin", "general_manager"})
 ARCHIVE_EXTS = {".zip", ".rar", ".7z", ".tar", ".gz"}
 SKIP_DIR_NAMES = frozenset({"$recycle.bin", "system volume information"})
 MAX_ZIP_BYTES = 2 * 1024 * 1024 * 1024
+MAX_UPLOAD_BYTES = MAX_ZIP_BYTES
 _DRIVE_RE = re.compile(r"^[A-Za-z]:")
+_ILLEGAL_NAME_CHARS = re.compile(r'[\\/:*?"<>|\x00-\x1f]')
+_WIN_RESERVED_NAMES = frozenset(
+    {
+        "con",
+        "prn",
+        "aux",
+        "nul",
+        *(f"com{i}" for i in range(1, 10)),
+        *(f"lpt{i}" for i in range(1, 10)),
+    }
+)
+_UPLOAD_CHUNK = 1024 * 1024
 _TABLES_READY = False
 
 
@@ -38,6 +54,7 @@ def ensure_tables() -> None:
     execute(CREATE_RESOURCE_FETCH_ROOTS_SQL)
     execute(CREATE_RESOURCE_FETCH_ROOT_ROLES_SQL)
     execute(CREATE_RESOURCE_FETCH_DOWNLOAD_LOGS_SQL)
+    execute(CREATE_RESOURCE_FETCH_WRITE_LOGS_SQL)
     _TABLES_READY = True
 
 
@@ -221,8 +238,19 @@ def admin_root_dict(row: dict, roles: list[dict[str, Any]] | None = None) -> dic
     }
 
 
+def user_is_admin(user: CurrentUser) -> bool:
+    return (user.role_code or "") in ADMIN_ROLE_CODES
+
+
+def assert_admin(user: CurrentUser) -> None:
+    if not user_is_admin(user):
+        raise HTTPException(status_code=403, detail="仅管理员可执行此操作")
+
+
 def user_can_access_root(root_id: int, user: CurrentUser, roles_by_root: dict[int, list[dict[str, Any]]] | None = None) -> bool:
-    """无角色配置（旧数据）= 所有登录用户可访问；有配置则仅所列角色。"""
+    """管理员可访问全部根目录；无角色配置（旧数据）= 所有登录用户；有配置则仅所列角色。"""
+    if user_is_admin(user):
+        return True
     if roles_by_root is None:
         assigned = _roles_map_for_roots([root_id]).get(int(root_id), [])
     else:
@@ -681,3 +709,249 @@ def prepare_download(root_id: int, rel: str | None, user: CurrentUser) -> tuple[
         user=user,
     )
     return tmp_path, download_name, "application/zip", True
+
+
+def sanitize_entry_name(raw: str, *, kind: str) -> str:
+    label = "文件夹名称" if kind == "dir" else "文件名"
+    text = str(raw or "").strip().replace("\\", "/")
+    text = text.split("/")[-1].strip()
+    text = _ILLEGAL_NAME_CHARS.sub("", text).rstrip(" .")
+    if not text or text in (".", "..") or text.startswith("."):
+        raise HTTPException(status_code=400, detail=f"{label}不合法")
+    if _skip_name(text):
+        raise HTTPException(status_code=400, detail=f"{label}不合法")
+    stem = Path(text).stem.lower()
+    if stem in _WIN_RESERVED_NAMES or text.lower() in _WIN_RESERVED_NAMES:
+        raise HTTPException(status_code=400, detail=f"{label}不可用")
+    if len(text) > 255:
+        text = text[:255].rstrip(" .")
+        if not text:
+            raise HTTPException(status_code=400, detail=f"{label}不合法")
+    return text
+
+
+def resolve_write_dir(root_id: int, rel: str | None) -> tuple[dict, Path, str]:
+    """解析当前浏览目录为可写入目标：必须存在、是文件夹、路径困在根内、中间层不是 symlink。"""
+    row = get_root_or_404(root_id, enabled_only=True)
+    safe_rel = parse_rel(rel)
+    root = root_path(row)
+    if not root.exists() or not root.is_dir():
+        raise HTTPException(status_code=400, detail="目录不存在或不可访问")
+    try:
+        root_resolved = root.resolve()
+    except OSError as exc:
+        raise HTTPException(status_code=400, detail=f"目录不可访问：{exc}") from exc
+
+    target = root_resolved
+    if safe_rel:
+        for part in safe_rel.split("/"):
+            nxt = target / part
+            try:
+                if nxt.is_symlink():
+                    raise HTTPException(status_code=400, detail="不支持写入该路径")
+            except OSError as exc:
+                raise HTTPException(status_code=400, detail=f"路径不可访问：{exc}") from exc
+            if not nxt.exists():
+                raise HTTPException(status_code=404, detail="目录不存在或不可访问")
+            if not nxt.is_dir():
+                raise HTTPException(status_code=400, detail="该路径不是文件夹")
+            try:
+                resolved = nxt.resolve()
+            except OSError as exc:
+                raise HTTPException(status_code=400, detail=f"路径不可访问：{exc}") from exc
+            if not _is_under(resolved, root_resolved):
+                raise HTTPException(status_code=400, detail="非法文件路径")
+            target = resolved
+    return row, target, safe_rel
+
+
+def record_write(
+    *,
+    root_id: int,
+    root_name: str,
+    rel_path: str,
+    file_name: str,
+    item_kind: str,
+    action: str,
+    user: CurrentUser,
+) -> None:
+    ensure_tables()
+    execute(
+        """
+        INSERT INTO resource_fetch_write_logs
+            (root_id, root_name, rel_path, file_name, item_kind, action,
+             created_by, created_by_user_id, created_at)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+        """,
+        (
+            int(root_id),
+            (root_name or "")[:128],
+            (rel_path or "")[:1024],
+            (file_name or "")[:255],
+            (item_kind or "file")[:16],
+            (action or "upload")[:16],
+            (user.name or user.username or "")[:64],
+            user.id,
+            datetime.now(),
+        ),
+    )
+
+
+def list_write_logs(
+    user: CurrentUser,
+    *,
+    root_id: int | None = None,
+    keyword: str = "",
+    limit: int = 50,
+    offset: int = 0,
+) -> dict[str, Any]:
+    assert_admin(user)
+    ensure_tables()
+    where = "1=1"
+    params: list[Any] = []
+    if root_id is not None:
+        where += " AND root_id = %s"
+        params.append(int(root_id))
+    text = (keyword or "").strip()
+    if text:
+        like = f"%{text}%"
+        where += " AND (root_name LIKE %s OR file_name LIKE %s OR rel_path LIKE %s OR created_by LIKE %s)"
+        params.extend([like, like, like, like])
+    total_row = fetch_one(
+        f"SELECT COUNT(*) AS cnt FROM resource_fetch_write_logs WHERE {where}",
+        tuple(params),
+    )
+    total = int((total_row or {}).get("cnt") or 0)
+    limit = max(1, min(int(limit or 50), 200))
+    offset = max(0, int(offset or 0))
+    rows = fetch_all(
+        f"""
+        SELECT id, root_id, root_name, rel_path, file_name, item_kind, action,
+               created_by, created_by_user_id, created_at
+        FROM resource_fetch_write_logs
+        WHERE {where}
+        ORDER BY created_at DESC, id DESC
+        LIMIT %s OFFSET %s
+        """,
+        (*params, limit, offset),
+    )
+    items = [
+        {
+            "id": int(r["id"]),
+            "root_id": int(r["root_id"]),
+            "root_name": str(r.get("root_name") or ""),
+            "rel_path": str(r.get("rel_path") or ""),
+            "file_name": str(r.get("file_name") or ""),
+            "item_kind": str(r.get("item_kind") or "file"),
+            "action": str(r.get("action") or "upload"),
+            "created_by": str(r.get("created_by") or ""),
+            "created_by_user_id": int(r["created_by_user_id"]) if r.get("created_by_user_id") else None,
+            "created_at": _dt_str(r.get("created_at")),
+        }
+        for r in rows
+    ]
+    return {"items": items, "total": total}
+
+
+def create_subdir(root_id: int, rel: str | None, name: str, user: CurrentUser) -> dict[str, Any]:
+    assert_admin(user)
+    row, dest_dir, safe_rel = resolve_write_dir(root_id, rel)
+    folder_name = sanitize_entry_name(name, kind="dir")
+    dest = dest_dir / folder_name
+    if dest.exists() or dest.is_symlink():
+        raise HTTPException(status_code=400, detail="同名文件或文件夹已存在")
+    try:
+        dest.mkdir(exist_ok=False)
+        resolved = dest.resolve()
+    except FileExistsError:
+        raise HTTPException(status_code=400, detail="同名文件或文件夹已存在") from None
+    except OSError as exc:
+        raise HTTPException(status_code=400, detail=f"无法创建文件夹：{exc}") from exc
+    try:
+        root_resolved = root_path(row).resolve()
+    except OSError as exc:
+        raise HTTPException(status_code=400, detail=f"目录不可访问：{exc}") from exc
+    if not _is_under(resolved, root_resolved):
+        raise HTTPException(status_code=400, detail="非法文件路径")
+    item_rel = _item_rel(safe_rel, folder_name)
+    record_write(
+        root_id=int(row["id"]),
+        root_name=str(row.get("name") or ""),
+        rel_path=item_rel,
+        file_name=folder_name,
+        item_kind="dir",
+        action="mkdir",
+        user=user,
+    )
+    return {"name": folder_name, "kind": "dir", "rel": item_rel}
+
+
+async def save_uploaded_file(
+    *,
+    root_id: int,
+    rel: str | None,
+    upload: UploadFile,
+    user: CurrentUser,
+) -> dict[str, Any]:
+    assert_admin(user)
+    row, dest_dir, safe_rel = resolve_write_dir(root_id, rel)
+    safe_name = sanitize_entry_name(upload.filename or "file", kind="file")
+    dest = dest_dir / safe_name
+    try:
+        root_resolved = root_path(row).resolve()
+        dest_check = dest_dir.resolve() / safe_name
+    except OSError as exc:
+        raise HTTPException(status_code=400, detail=f"路径不可访问：{exc}") from exc
+    if not _is_under(dest_check, root_resolved):
+        raise HTTPException(status_code=400, detail="非法文件路径")
+    if dest.exists() or dest.is_symlink():
+        raise HTTPException(status_code=400, detail="同名文件或文件夹已存在")
+
+    tmp_path = dest_dir / f".rf_up_{uuid.uuid4().hex}.tmp"
+    written = 0
+    created_placeholder = False
+    try:
+        with tmp_path.open("wb") as out:
+            while True:
+                chunk = await upload.read(_UPLOAD_CHUNK)
+                if not chunk:
+                    break
+                written += len(chunk)
+                if written > MAX_UPLOAD_BYTES:
+                    raise HTTPException(status_code=400, detail="文件过大（超过 2GB）")
+                out.write(chunk)
+        if written <= 0:
+            raise HTTPException(status_code=400, detail="不能上传空文件")
+        try:
+            fd = os.open(str(dest), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            raise HTTPException(status_code=400, detail="同名文件或文件夹已存在") from None
+        os.close(fd)
+        created_placeholder = True
+        os.replace(str(tmp_path), str(dest))
+        created_placeholder = False
+    except HTTPException:
+        tmp_path.unlink(missing_ok=True)
+        if created_placeholder:
+            dest.unlink(missing_ok=True)
+        raise
+    except OSError as exc:
+        tmp_path.unlink(missing_ok=True)
+        if created_placeholder:
+            dest.unlink(missing_ok=True)
+        raise HTTPException(status_code=400, detail=f"无法写入：{exc}") from exc
+    else:
+        tmp_path.unlink(missing_ok=True)
+
+    kind = "archive" if Path(safe_name).suffix.lower() in ARCHIVE_EXTS else "file"
+    item_rel = _item_rel(safe_rel, safe_name)
+    record_write(
+        root_id=int(row["id"]),
+        root_name=str(row.get("name") or ""),
+        rel_path=item_rel,
+        file_name=safe_name,
+        item_kind=kind,
+        action="upload",
+        user=user,
+    )
+    return {"name": safe_name, "kind": kind, "size": written, "rel": item_rel}

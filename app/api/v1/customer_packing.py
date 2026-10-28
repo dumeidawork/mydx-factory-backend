@@ -12,7 +12,8 @@ from pydantic import BaseModel, Field
 from typing_extensions import Annotated
 
 from app.api.deps import CurrentUser, get_current_user
-from app.utils.drawing_no import drawing_no_match_variants, normalize_drawing_input
+from app.utils.drawing_no import drawing_no_base, drawing_no_match_variants, normalize_drawing_input
+from app.api.v1.drawing_flange_type_maps import load_flange_type_map, lookup_flange_type
 from app.core.database import execute, fetch_all, fetch_one
 from app.services.france_sea_packing_parser import calc_total_weight, dn_key, drawing_rev_number, parse_sea_workbook
 from app.services.in_memory_store import now_iso
@@ -86,6 +87,8 @@ CREATE TABLE IF NOT EXISTS france_customer_packing_list_items (
     excel_total_weight DECIMAL(12,2) NULL COMMENT 'Excel G列原值（仅核对）',
     weight_mismatch TINYINT NOT NULL DEFAULT 0 COMMENT 'Excel总重与单重*数量不一致',
     match_warning VARCHAR(255) NOT NULL DEFAULT '' COMMENT '回填警告',
+    box_no INT NULL COMMENT '主箱号（件数最多的箱）',
+    actual_delivery_date DATE NULL COMMENT '实际交货日期（与离港日分开）',
     created_by VARCHAR(64) NULL COMMENT '上传者',
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP COMMENT '上传时间',
     updated_by VARCHAR(64) NULL COMMENT '更新者',
@@ -171,6 +174,14 @@ ITEM_COLUMN_ALTERS = (
         "tax_total_amount",
         "ALTER TABLE france_customer_packing_list_items ADD COLUMN tax_total_amount DECIMAL(14,2) NOT NULL DEFAULT 0.00 COMMENT '含税总价（含税单价×数量）' AFTER tax_unit_price",
     ),
+    (
+        "box_no",
+        "ALTER TABLE france_customer_packing_list_items ADD COLUMN box_no INT NULL COMMENT '主箱号（件数最多的箱）' AFTER match_warning",
+    ),
+    (
+        "actual_delivery_date",
+        "ALTER TABLE france_customer_packing_list_items ADD COLUMN actual_delivery_date DATE NULL COMMENT '实际交货日期（与离港日分开）' AFTER box_no",
+    ),
 )
 
 
@@ -204,7 +215,8 @@ class PackingItemIn(BaseModel):
 
 class OrderContractIn(BaseModel):
     order_no: str
-    contract_archive_id: int
+    contract_archive_id: int = 0
+    defer_contract: bool = False
 
 
 class SavePackingRequest(BaseModel):
@@ -541,7 +553,14 @@ def _empty_enrich() -> dict[str, Any]:
         "multi_drawing": 0,
         "drawing_confirmed": 0,
         "match_warning": "",
+        "material_matched": 0,
+        "price_matched": 0,
     }
+
+
+SPLIT_PRICE_MISSING_WARNING = "价格拆分表无此图纸的有效报价，当前价格为 0"
+MANUAL_PRICE_WARNING = "价格拆分表无有效报价，当前为手工填写"
+_SPEC_KEYS = ("spec_model", "spec", "model", "material")
 
 
 def _material_payload(row: dict) -> dict[str, Any]:
@@ -551,15 +570,89 @@ def _material_payload(row: dict) -> dict[str, Any]:
         "spec": str(row.get("spec") or ""),
         "model": str(row.get("model") or ""),
         "material": str(row.get("material") or ""),
-        "product_unit_price": float(row.get("product_unit_price") or 0),
-        "agreement_price": float(row.get("france_agreement_price") or 0),
+        "product_unit_price": 0.0,
+        "agreement_price": 0.0,
     }
+
+
+def _fill_split_prices(result: dict[str, Any], material_no: str) -> bool:
+    """图纸已选定时从法国价格拆分有效行取价。缺报价或价格为 0 时返回 True。"""
+    from app.services.material_align import load_order_prices_from_split
+
+    drawing = str(result.get("drawing_no") or "").strip()
+    if not drawing:
+        result["product_unit_price"] = 0.0
+        result["agreement_price"] = 0.0
+        result["price_matched"] = 0
+        return False
+    prices = load_order_prices_from_split(material_no, drawing)
+    agreement = round(float(prices.get("france_agreement_price") or 0), 2)
+    product = round(float(prices.get("france_tax_inclusive_price") or 0), 2)
+    result["agreement_price"] = agreement
+    result["product_unit_price"] = product
+    missing = agreement == 0 or product == 0
+    result["price_matched"] = 0 if missing else 1
+    return missing
+
+
+def _finish_enrich(result: dict[str, Any], warnings: list[str]) -> dict[str, Any]:
+    result["match_warning"] = "；".join(w for w in warnings if w)
+    return result
+
+
+def _note_price_match(result: dict[str, Any], material_no: str, warnings: list[str]) -> None:
+    if _fill_split_prices(result, material_no):
+        if str(result.get("drawing_no") or "").strip():
+            warnings.append(SPLIT_PRICE_MISSING_WARNING)
+
+
+def _price_warning_for_values(warning: str, product_unit_price: Any, agreement_price: Any, price_matched: int) -> str:
+    if price_matched:
+        return warning
+    if float(product_unit_price or 0) <= 0 or float(agreement_price or 0) <= 0:
+        return warning
+    if SPLIT_PRICE_MISSING_WARNING in warning:
+        return warning.replace(SPLIT_PRICE_MISSING_WARNING, MANUAL_PRICE_WARNING)
+    return warning
+
+
+def _merge_enrich_into(merged: dict[str, Any], extra: dict[str, Any], *, drawing_changed: bool) -> None:
+    """命中档案时用回填值覆盖；未命中时保留手工规格和价格。换图纸仍未命中则清空规格和价格。"""
+    if int(extra.get("material_matched") or 0):
+        for key in ("drawing_no", *_SPEC_KEYS, "drawing_candidates", "multi_drawing", "drawing_confirmed"):
+            merged[key] = extra.get(key)
+        merged["material_matched"] = 1
+    else:
+        if drawing_changed:
+            for key in _SPEC_KEYS:
+                merged[key] = ""
+        merged["drawing_no"] = extra.get("drawing_no") or merged.get("drawing_no") or ""
+        merged["drawing_candidates"] = extra.get("drawing_candidates") or []
+        merged["multi_drawing"] = int(extra.get("multi_drawing") or 0)
+        merged["drawing_confirmed"] = 1 if str(merged.get("drawing_no") or "").strip() else 0
+        merged["material_matched"] = 0
+    if int(extra.get("price_matched") or 0):
+        merged["product_unit_price"] = extra.get("product_unit_price") or 0
+        merged["agreement_price"] = extra.get("agreement_price") or 0
+        merged["price_matched"] = 1
+    else:
+        merged["price_matched"] = 0
+        if drawing_changed:
+            merged["product_unit_price"] = 0
+            merged["agreement_price"] = 0
+    merged["match_warning"] = _price_warning_for_values(
+        str(extra.get("match_warning") or ""),
+        merged.get("product_unit_price"),
+        merged.get("agreement_price"),
+        int(merged.get("price_matched") or 0),
+    )
 
 
 def enrich_material(material_no: str, dn: str = "", drawing_no: str = "") -> dict[str, Any]:
     from app.api.v1.workflow import _ensure_materials_table
 
     key_no = (material_no or "").strip()
+    wanted_drawing = normalize_drawing_input(drawing_no)
     result = _empty_enrich()
     if not key_no:
         result["match_warning"] = "物料号为空"
@@ -567,8 +660,7 @@ def enrich_material(material_no: str, dn: str = "", drawing_no: str = "") -> dic
     _ensure_materials_table()
     rows = fetch_all(
         """
-        SELECT material_no, drawing_no, spec_model, spec, model, material,
-               product_unit_price, france_agreement_price
+        SELECT material_no, drawing_no, spec_model, spec, model, material
         FROM materials
         WHERE material_no=%s
         ORDER BY id
@@ -576,10 +668,12 @@ def enrich_material(material_no: str, dn: str = "", drawing_no: str = "") -> dic
         (key_no,),
     )
     if not rows:
-        result["match_warning"] = "未找到物料"
-        return result
+        result["drawing_no"] = wanted_drawing
+        result["drawing_confirmed"] = 1 if wanted_drawing else 0
+        warnings = ["未找到物料，请手工填写图纸与规格"]
+        _note_price_match(result, key_no, warnings)
+        return _finish_enrich(result, warnings)
 
-    wanted_drawing = normalize_drawing_input(drawing_no)
     wanted_variants = set(drawing_no_match_variants(wanted_drawing)) if wanted_drawing else set()
     dn_wanted = dn_key(dn)
 
@@ -604,31 +698,37 @@ def enrich_material(material_no: str, dn: str = "", drawing_no: str = "") -> dic
             None,
         )
         if not picked:
-            result["match_warning"] = "未找到所选图纸号"
-            result["drawing_candidates"] = [str(r.get("drawing_no") or "") for r in rows if r.get("drawing_no")]
-            return result
+            candidates = [str(r.get("drawing_no") or "") for r in rows if r.get("drawing_no")]
+            result["drawing_no"] = wanted_drawing
+            result["drawing_candidates"] = candidates
+            result["multi_drawing"] = 1 if len(set(candidates)) > 1 else 0
+            result["drawing_confirmed"] = 1
+            warnings = ["未找到所选图纸号，请手工填写规格"]
+            _note_price_match(result, key_no, warnings)
+            return _finish_enrich(result, warnings)
         pool = dn_matched or rows
         candidates = [str(r.get("drawing_no") or "") for r in pool if r.get("drawing_no")]
         result.update(_material_payload(picked))
+        result["material_matched"] = 1
         result["drawing_candidates"] = candidates
         result["multi_drawing"] = 1 if len(set(candidates)) > 1 else 0
         result["drawing_confirmed"] = 1
-        if float(result["agreement_price"] or 0) == 0 or float(result["product_unit_price"] or 0) == 0:
-            result["match_warning"] = "价格为0，请核对物料建档"
-        return result
+        warnings = []
+        _note_price_match(result, key_no, warnings)
+        return _finish_enrich(result, warnings)
 
     if not dn_wanted:
         candidates = [str(r.get("drawing_no") or "") for r in rows if r.get("drawing_no")]
         result["drawing_candidates"] = candidates
         result["multi_drawing"] = 1 if len(set(candidates)) > 1 else 0
-        result["match_warning"] = "规格为空，请选择图纸号"
+        result["match_warning"] = "规格为空，请选择或填写图纸号"
         return result
 
     if not dn_matched:
         candidates = [str(r.get("drawing_no") or "") for r in rows if r.get("drawing_no")]
         result["drawing_candidates"] = candidates
         result["multi_drawing"] = 1 if len(set(candidates)) > 1 else 0
-        result["match_warning"] = "物料号已找到但规格不匹配，请选择图纸号"
+        result["match_warning"] = "物料号已找到但规格不匹配，请选择或填写图纸号"
         return result
 
     ranked = sorted(dn_matched, key=lambda r: drawing_rev_number(str(r.get("drawing_no") or "")), reverse=True)
@@ -636,6 +736,7 @@ def enrich_material(material_no: str, dn: str = "", drawing_no: str = "") -> dic
     candidates = [str(r.get("drawing_no") or "") for r in ranked if r.get("drawing_no")]
     unique_drawings = list(dict.fromkeys(candidates))
     result.update(_material_payload(picked))
+    result["material_matched"] = 1
     result["drawing_candidates"] = unique_drawings
     multi = len(unique_drawings) > 1
     result["multi_drawing"] = 1 if multi else 0
@@ -643,10 +744,8 @@ def enrich_material(material_no: str, dn: str = "", drawing_no: str = "") -> dic
     warnings = []
     if multi:
         warnings.append("存在多个图纸版本，已选 Rev 最大者，请确认")
-    if float(result["agreement_price"] or 0) == 0 or float(result["product_unit_price"] or 0) == 0:
-        warnings.append("价格为0，请核对物料建档")
-    result["match_warning"] = "；".join(warnings)
-    return result
+    _note_price_match(result, key_no, warnings)
+    return _finish_enrich(result, warnings)
 
 
 def _apply_enrich_to_item(item: dict[str, Any]) -> dict[str, Any]:
@@ -1076,23 +1175,23 @@ def patch_france_item(item_id: int, req: ItemPatchRequest, user: UserDep):
         "drawing_confirmed",
         "match_warning",
     }
+    previous_drawing = normalize_drawing_input(current.get("drawing_no"))
     merged = _row_to_dict(current)
     for key, value in (req.patch or {}).items():
         if key in allowed:
             merged[key] = value
-    if any(k in req.patch for k in ("material_no", "dn")) and "drawing_no" not in req.patch:
-        merged["drawing_no"] = ""
-        extra = enrich_material(str(merged.get("material_no") or ""), str(merged.get("dn") or ""), "")
-        merged.update(extra)
-    elif "drawing_no" in req.patch:
-        merged["drawing_no"] = normalize_drawing_input(merged.get("drawing_no"))
+    if any(k in req.patch for k in ("material_no", "dn", "drawing_no")):
+        if "drawing_no" not in req.patch and any(k in req.patch for k in ("material_no", "dn")):
+            merged["drawing_no"] = ""
+        else:
+            merged["drawing_no"] = normalize_drawing_input(merged.get("drawing_no"))
+        drawing_changed = normalize_drawing_input(merged.get("drawing_no")) != previous_drawing
         extra = enrich_material(
             str(merged.get("material_no") or ""),
             str(merged.get("dn") or ""),
             str(merged.get("drawing_no") or ""),
         )
-        merged.update(extra)
-        merged["drawing_confirmed"] = 1
+        _merge_enrich_into(merged, extra, drawing_changed=drawing_changed)
     merged["total_weight"] = calc_total_weight(float(merged.get("unit_weight") or 0), int(merged.get("quantity") or 0))
     _apply_tax_fields(merged)
     execute(
@@ -1194,6 +1293,7 @@ def generate_france_orders(list_id: int, req: GenerateOrdersRequest, user: UserD
         raise HTTPException(status_code=400, detail="客户不能为空，请先保存整单")
 
     warnings = []
+    flange_by_drawing = load_flange_type_map()
     for idx, item in enumerate(items, start=1):
         if not str(item.get("material_no") or "").strip():
             warnings.append(f"第{idx}行物料号为空")
@@ -1201,10 +1301,13 @@ def generate_france_orders(list_id: int, req: GenerateOrdersRequest, user: UserD
             warnings.append(f"第{idx}行 PO 为空")
         if int(item.get("multi_drawing") or 0) and not int(item.get("drawing_confirmed") or 0):
             warnings.append(f"第{idx}行存在多个图纸版本未确认")
-        if not str(item.get("drawing_no") or "").strip():
+        drawing_raw = str(item.get("drawing_no") or "").strip()
+        if not drawing_raw:
             warnings.append(f"第{idx}行未匹配图纸号")
+        elif not lookup_flange_type(drawing_raw, flange_by_drawing):
+            warnings.append(f"第{idx}行图纸号未匹配法兰类型（{drawing_no_base(drawing_raw)}）")
         if float(item.get("agreement_price") or 0) == 0 or float(item.get("product_unit_price") or 0) == 0:
-            warnings.append(f"第{idx}行价格为0")
+            warnings.append(f"第{idx}行价格拆分表无有效报价")
     if warnings and not req.confirm_warnings:
         raise HTTPException(status_code=400, detail={"message": "生成前请确认以下问题", "warnings": warnings})
 
@@ -1257,6 +1360,7 @@ def generate_france_orders(list_id: int, req: GenerateOrdersRequest, user: UserD
             total_weight = calc_total_weight(unit_weight, quantity)
             agreement_price = round(float(item.get("agreement_price") or 0), 2)
             product_unit_price = round(float(item.get("product_unit_price") or 0), 2)
+            remark1 = lookup_flange_type(drawing_no, flange_by_drawing)
             record_id = execute(
                 f"""
                 INSERT INTO order_details (
@@ -1284,7 +1388,7 @@ def generate_france_orders(list_id: int, req: GenerateOrdersRequest, user: UserD
                     total_weight,
                     agreement_price,
                     product_unit_price,
-                    "",
+                    remark1,
                     "",
                     "",
                     "",
@@ -1316,6 +1420,7 @@ def generate_france_orders(list_id: int, req: GenerateOrdersRequest, user: UserD
                 "total_weight": total_weight,
                 "agreement_price": agreement_price,
                 "product_unit_price": product_unit_price,
+                "remark1": remark1,
                 "status": "开始",
                 "doc_status": doc_status,
                 "upload_type": "文件上传",

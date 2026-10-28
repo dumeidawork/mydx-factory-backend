@@ -7,7 +7,7 @@ import sys
 import tempfile
 import traceback
 from copy import copy
-from datetime import datetime
+from datetime import date, datetime
 import json
 from pathlib import Path
 from typing import Any
@@ -334,6 +334,8 @@ def _packing_row_from_db(row: dict) -> dict:
         "packed_at": str(row.get("packed_at") or ""),
         "created_at": str(row.get("created_at") or ""),
         "updated_at": str(row.get("updated_at") or ""),
+        "created_by": row.get("created_by", "") or "",
+        "updated_by": row.get("updated_by", "") or "",
     }
 
 
@@ -988,7 +990,7 @@ _ORDER_DETAIL_SELECT_COLUMNS = """
         id, order_no, customer, factory_order_no, seq, item_no, name, drawing_no, material_no, spec_model, spec, standard,
         material, quantity, unit_weight, total_weight, agreement_price, product_unit_price, remark1, remark2,
         heat_no, heat_treatment_batch_no, order_status, doc_status, upload_type, material_mode,
-        started_at, finished_at, packed_at, shipped_at, created_at, updated_at,
+        started_at, finished_at, packed_at, shipped_at, split_group_id, contract_qty, created_at, updated_at,
         created_by, created_by_user_id, updated_by, updated_by_user_id
 """
 
@@ -1224,6 +1226,8 @@ def _order_detail_cache_from_db(r: dict) -> dict:
         "finished_at": str(r.get("finished_at") or ""),
         "packed_at": str(r.get("packed_at") or ""),
         "shipped_at": str(r.get("shipped_at") or ""),
+        "split_group_id": int(r["split_group_id"]) if r.get("split_group_id") is not None else None,
+        "contract_qty": int(r["contract_qty"]) if r.get("contract_qty") is not None else None,
         "created_at": str(r.get("created_at") or ""),
         "updated_at": str(r.get("updated_at") or ""),
         "created_by": r.get("created_by", "") or "",
@@ -1282,10 +1286,14 @@ def _ensure_order_details_loaded() -> None:
     _ensure_order_details_doc_status_column()
     _ensure_order_details_price_columns()
     _ensure_order_details_audit()
+    from app.services.dalian_order_split import ensure_split_columns
+
+    ensure_split_columns()
     if order_details and (
         "doc_status" not in order_details[0]
         or "agreement_price" not in order_details[0]
         or "created_by" not in order_details[0]
+        or "split_group_id" not in order_details[0]
     ):
         order_details.clear()
     if order_details:
@@ -1345,6 +1353,7 @@ def _ensure_materials_table() -> None:
         ("standard_no", "ALTER TABLE materials ADD COLUMN standard_no VARCHAR(255) NOT NULL DEFAULT '' COMMENT '标准号' AFTER drawing_no"),
         ("spec", "ALTER TABLE materials ADD COLUMN spec VARCHAR(64) NOT NULL DEFAULT '' COMMENT '规格' AFTER spec_model"),
         ("model", "ALTER TABLE materials ADD COLUMN model VARCHAR(64) NOT NULL DEFAULT '' COMMENT '型号' AFTER spec"),
+        ("drawing_archive_id", "ALTER TABLE materials ADD COLUMN drawing_archive_id BIGINT NULL COMMENT '对应图纸建档 id' AFTER drawing_no"),
     ]:
         row = fetch_one(
             """
@@ -1356,6 +1365,17 @@ def _ensure_materials_table() -> None:
         )
         if not row:
             execute(stmt)
+    idx = fetch_one(
+        """
+        SELECT 1 FROM information_schema.statistics
+        WHERE table_schema = DATABASE()
+          AND table_name = 'materials'
+          AND index_name = 'idx_material_drawing_archive'
+        LIMIT 1
+        """
+    )
+    if not idx:
+        execute("ALTER TABLE materials ADD INDEX idx_material_drawing_archive (drawing_archive_id)")
 
 
 def _material_row_from_db(row: dict) -> dict:
@@ -1427,6 +1447,7 @@ def upsert_material_from_drawing(
     material: str,
     unit_weight: float,
     operator: str,
+    drawing_archive_id: int | None = None,
 ) -> str:
     """图纸上传/修改时同步物料：按物料号+图纸号+标准号插入或覆盖。"""
     _ensure_materials_table()
@@ -1436,11 +1457,13 @@ def upsert_material_from_drawing(
     key_drawing = _norm_drawing(drawing_no)
     key_standard = _normalize_str(standard_no)
     existing = _find_material_duplicate(key_no, key_drawing, key_standard)
+    archive_id = int(drawing_archive_id) if drawing_archive_id else None
     if existing:
         execute(
             """
             UPDATE materials
             SET spec=%s, model=%s, spec_model=%s, material=%s, unit_weight=%s,
+                drawing_archive_id=COALESCE(%s, drawing_archive_id),
                 updated_by=%s, updated_at=NOW()
             WHERE id=%s
             """,
@@ -1450,17 +1473,19 @@ def upsert_material_from_drawing(
                 _normalize_str(spec_model),
                 _normalize_str(material),
                 float(unit_weight or 0),
+                archive_id,
                 _normalize_str(operator),
                 int(existing["id"]),
             ),
         )
+        _sync_qty_map_dn([key_no], operator)
         return "updated"
     execute(
         """
         INSERT INTO materials (
             material_no, drawing_no, standard_no, spec, model, spec_model, material, unit_weight,
-            created_by, updated_by
-        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            drawing_archive_id, created_by, updated_by
+        ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         """,
         (
             key_no,
@@ -1471,10 +1496,12 @@ def upsert_material_from_drawing(
             _normalize_str(spec_model),
             _normalize_str(material),
             float(unit_weight or 0),
+            archive_id,
             _normalize_str(operator),
             _normalize_str(operator),
         ),
     )
+    _sync_qty_map_dn([key_no], operator)
     return "inserted"
 
 
@@ -1646,15 +1673,73 @@ def _packing_draft_values_from_order(order_no: str, r: dict) -> tuple[Any, ...]:
         "",
         None,
         None,
+        None,
+        None,
+        None,
+        None,
     )
+
+
+def _packing_draft_values_from_customer(order_no: str, r: dict) -> tuple[Any, ...]:
+    from app.api.v1.drawing_flange_type_maps import lookup_flange_type
+
+    qty = int(r.get("quantity", 0) or 0)
+    unit_weight = round(float(r.get("unit_weight", 0) or 0), 2)
+    total_weight = round(float(r.get("total_weight", 0) or 0), 2)
+    if not total_weight:
+        total_weight = round(qty * unit_weight, 2)
+    return (
+        order_no,
+        r.get("material_no", "") or "",
+        r.get("spec", "") or r.get("dn", "") or "",
+        r.get("model", "") or r.get("standard", "") or "",
+        r.get("material", "") or "",
+        qty,
+        unit_weight,
+        total_weight,
+        0.0,
+        lookup_flange_type(str(r.get("drawing_no") or "")),
+        0,
+        int(r["pos"]) if r.get("pos") is not None else None,
+        0,
+        0,
+        0,
+        "",
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+
+
+def _ensure_packing_details_schema() -> None:
+    for column_name, stmt in [
+        ("created_by", "ALTER TABLE packing_details ADD COLUMN created_by VARCHAR(64) NULL COMMENT '上传者' AFTER updated_at"),
+        ("created_by_user_id", "ALTER TABLE packing_details ADD COLUMN created_by_user_id INT NULL COMMENT '上传者用户ID' AFTER created_by"),
+        ("updated_by", "ALTER TABLE packing_details ADD COLUMN updated_by VARCHAR(64) NULL COMMENT '更改者' AFTER created_by_user_id"),
+        ("updated_by_user_id", "ALTER TABLE packing_details ADD COLUMN updated_by_user_id INT NULL COMMENT '更改者用户ID' AFTER updated_by"),
+    ]:
+        row = fetch_one(
+            """
+            SELECT 1 FROM information_schema.columns
+            WHERE table_schema = DATABASE() AND table_name = 'packing_details' AND column_name = %s
+            LIMIT 1
+            """,
+            (column_name,),
+        )
+        if not row:
+            execute(stmt)
 
 
 _PACKING_INSERT_SQL = """
     INSERT INTO packing_details (
         order_no, material_no, spec, standard, material, quantity, unit_weight, total_weight,
         gross_weight, remark1, box_no, entry_no, box_length, box_width, box_height,
-        packing_remark, delivery_date, packed_at
-    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        packing_remark, delivery_date, packed_at,
+        created_by, created_by_user_id, updated_by, updated_by_user_id
+    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
 """
 
 
@@ -1678,19 +1763,37 @@ def _ensure_packing_row_for_order_detail(order_row: dict) -> bool:
         (order_no, material_no, item_key),
     ):
         return False
-    execute(_PACKING_INSERT_SQL, _packing_draft_values_from_order(order_no, order_row))
+    from app.api.v1.customer_packing import _ensure_tables as _ensure_customer_packing
+
+    _ensure_customer_packing()
+    item = fetch_one(
+        """
+        SELECT i.*
+        FROM france_customer_packing_list_items i
+        JOIN france_customer_packing_lists l ON l.id = i.list_id
+        WHERE TRIM(i.po)=%s AND i.material_no=%s AND COALESCE(i.pos, 0)=%s
+        ORDER BY l.updated_at DESC, i.id DESC
+        LIMIT 1
+        """,
+        (order_no, material_no, item_key),
+    )
+    if not item:
+        return False
+    execute(_PACKING_INSERT_SQL, _packing_draft_values_from_customer(order_no, item))
     _reload_packing_details_cache()
     return True
 
 
 def _ensure_packing_details_loaded() -> None:
+    _ensure_packing_details_schema()
     if packing_details:
         return
     rows = fetch_all(
         f"""
         SELECT p.id, p.order_no, p.material_no, p.spec, p.standard, p.material, p.quantity, p.unit_weight, p.total_weight,
                p.gross_weight, p.remark1, p.box_no, COALESCE(p.entry_no, o.item_no) AS entry_no, p.box_length, p.box_width, p.box_height,
-               p.packing_remark, p.delivery_date, p.packed_at, p.created_at, p.updated_at
+               p.packing_remark, p.delivery_date, p.packed_at, p.created_at, p.updated_at,
+               p.created_by, p.updated_by
         FROM packing_details p
         {_packing_order_join_sql()}
         ORDER BY p.id
@@ -1709,7 +1812,8 @@ def _fetch_packing_rows_from_db(order_no: str) -> list[dict]:
         f"""
         SELECT p.id, p.order_no, p.material_no, p.spec, p.standard, p.material, p.quantity, p.unit_weight, p.total_weight,
                p.gross_weight, p.remark1, p.box_no, COALESCE(p.entry_no, o.item_no) AS entry_no, p.box_length, p.box_width, p.box_height,
-               p.packing_remark, p.delivery_date, p.packed_at, p.created_at, p.updated_at
+               p.packing_remark, p.delivery_date, p.packed_at, p.created_at, p.updated_at,
+               p.created_by, p.updated_by
         FROM packing_details p
         {_packing_order_join_sql()}
         WHERE p.order_no=%s
@@ -1721,6 +1825,7 @@ def _fetch_packing_rows_from_db(order_no: str) -> list[dict]:
 
 
 def _initialize_packing_rows(order_no: str) -> None:
+    _ensure_packing_details_schema()
     existing = fetch_all(
         "SELECT material_no, entry_no FROM packing_details WHERE order_no=%s",
         (order_no,),
@@ -1729,22 +1834,40 @@ def _initialize_packing_rows(order_no: str) -> None:
         (str(r.get("material_no") or ""), _item_no_key(r.get("entry_no")))
         for r in existing
     }
-    source_rows = fetch_all(
+    from app.api.v1.customer_packing import _ensure_tables as _ensure_customer_packing
+
+    _ensure_customer_packing()
+    header = fetch_one(
         """
-        SELECT id, material_no, spec, standard, material, quantity, unit_weight, total_weight, remark1, item_no
-        FROM order_details
-        WHERE order_no=%s AND order_status NOT IN ('开始', '分割', '加工', '再加工')
-        ORDER BY id
+        SELECT l.id
+        FROM france_customer_packing_lists l
+        WHERE EXISTS (
+            SELECT 1 FROM france_customer_packing_list_items i
+            WHERE i.list_id = l.id AND TRIM(i.po)=%s
+        )
+        ORDER BY l.updated_at DESC, l.id DESC
+        LIMIT 1
         """,
         (order_no,),
     )
+    if not header:
+        return
+    source_rows = fetch_all(
+        """
+        SELECT material_no, spec, dn, model, material, quantity, unit_weight, total_weight, pos, drawing_no
+        FROM france_customer_packing_list_items
+        WHERE list_id=%s AND TRIM(po)=%s
+        ORDER BY COALESCE(pos, 999999), seq, id
+        """,
+        (int(header["id"]), order_no),
+    )
     to_insert: list[tuple[Any, ...]] = []
     for r in source_rows:
-        key = (str(r.get("material_no") or ""), _item_no_key(r.get("item_no")))
+        key = (str(r.get("material_no") or ""), _item_no_key(r.get("pos")))
         if key in existing_keys:
             continue
         existing_keys.add(key)
-        to_insert.append(_packing_draft_values_from_order(order_no, r))
+        to_insert.append(_packing_draft_values_from_customer(order_no, r))
     if not to_insert:
         return
     execute_many(_PACKING_INSERT_SQL, to_insert)
@@ -2144,7 +2267,8 @@ class DalianShippingSubmitRequest(BaseModel):
 
 
 class DalianShippingGenerateMarkRequest(BaseModel):
-    delivery_date: str
+    ids: list[int] = []
+    header_date: str
 
 
 class DalianShippingSaveRowRequest(BaseModel):
@@ -2406,20 +2530,73 @@ def _serialize_dalian_db_row(row: dict[str, Any]) -> dict[str, Any]:
         "heat_no": _normalize_str(row.get("heat_no")),
         "heat_treatment_batch_no": _normalize_str(row.get("heat_treatment_batch_no")),
         "shipping_mark_remark": _normalize_str(row.get("shipping_mark_remark")),
+        "planned_arrival_date": _dalian_planned_date_text(row.get("planned_arrival_date")),
+        "reservation_id": int(row["reservation_id"]) if row.get("reservation_id") else None,
         "created_by": _normalize_str(row.get("created_by")),
         "created_at": row.get("created_at"),
     }
 
 
+def _dalian_planned_date_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if hasattr(value, "strftime"):
+        return value.strftime("%Y-%m-%d")
+    text = _normalize_str(value)
+    if len(text) >= 10 and text[4] == "-":
+        return text[:10]
+    return text
+
+
+def _parse_dalian_planned_date(value: str) -> date:
+    text = _normalize_str(value)
+    try:
+        return datetime.strptime(text[:10], "%Y-%m-%d").date()
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="预定到货日期格式应为 YYYY-MM-DD") from exc
+
+
 def _fetch_dalian_rows_by_date(delivery_date: str) -> list[dict[str, Any]]:
+    return _fetch_dalian_shipping_rows(delivery_date=delivery_date)
+
+
+def _fetch_dalian_shipping_rows(
+    *,
+    delivery_date: str = "",
+    planned_arrival_date: date | None = None,
+    ids: list[int] | None = None,
+) -> list[dict[str, Any]]:
+    from app.api.v1.dalian_packing import _ensure_tables as ensure_dalian_packing_tables
+
+    ensure_dalian_packing_tables()
+    clauses: list[str] = []
+    params: list[Any] = []
+    if ids is not None:
+        clean_ids = [int(item) for item in ids if item]
+        if not clean_ids:
+            return []
+        placeholders = ", ".join(["%s"] * len(clean_ids))
+        clauses.append(f"id IN ({placeholders})")
+        params.extend(clean_ids)
+    else:
+        matched: list[str] = []
+        if delivery_date:
+            matched.append("delivery_date=%s")
+            params.append(delivery_date)
+        if planned_arrival_date:
+            matched.append("planned_arrival_date=%s")
+            params.append(planned_arrival_date)
+        if not matched:
+            return []
+        clauses.append("(" + " OR ".join(matched) + ")")
     rows = fetch_all(
-        """
+        f"""
         SELECT *
         FROM dalian_shipping_details
-        WHERE delivery_date = %s
+        WHERE {' AND '.join(clauses)}
         ORDER BY id ASC
         """,
-        (delivery_date,),
+        tuple(params),
     )
     return [_serialize_dalian_db_row(r) for r in rows]
 
@@ -2789,6 +2966,106 @@ def create_manual_order(req: ManualOrderSubmitRequest, user: UserDep):
     }
 
 
+def _empty_dalian_shipment_fields() -> dict[str, str]:
+    return {"planned_arrival_date": "", "actual_delivery_date": "", "reservation_status": ""}
+
+
+def _format_shipment_day(value: Any) -> str:
+    if value is None:
+        return ""
+    if hasattr(value, "strftime"):
+        return value.strftime("%Y-%m-%d")
+    text = _normalize_str(value)
+    digits = "".join(ch for ch in text if ch.isdigit())
+    if len(digits) >= 8:
+        return f"{digits[:4]}-{digits[4:6]}-{digits[6:8]}"
+    return text[:10]
+
+
+def _parse_qc_filter_day(value: str) -> date | None:
+    text = _normalize_str(value)
+    if not text:
+        return None
+    try:
+        return datetime.strptime(text[:10], "%Y-%m-%d").date()
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="日期格式应为 YYYY-MM-DD") from exc
+
+
+def _qc_detail_ids_for_dates(planned_arrival_date: str, delivery_date: str) -> set[int] | None:
+    planned = _parse_qc_filter_day(planned_arrival_date)
+    delivery = _parse_qc_filter_day(delivery_date)
+    if planned is None and delivery is None:
+        return None
+    from app.api.v1.dalian_shipping_reservations import _ensure_tables as ensure_reservations
+
+    ensure_reservations()
+    ids: set[int] = set()
+    if planned is not None:
+        rows = fetch_all(
+            """
+            SELECT DISTINCT order_detail_id
+            FROM dalian_shipping_reservations
+            WHERE planned_arrival_date=%s AND planned_qty > 0 AND order_detail_id IS NOT NULL
+            """,
+            (planned,),
+        )
+        ids.update(int(row["order_detail_id"]) for row in rows if row.get("order_detail_id"))
+    if delivery is not None:
+        rows = fetch_all(
+            """
+            SELECT DISTINCT r.order_detail_id
+            FROM dalian_shipping_details d
+            INNER JOIN dalian_shipping_reservations r ON r.id = d.reservation_id
+            WHERE d.delivery_date IN (%s, %s) AND r.order_detail_id IS NOT NULL
+            """,
+            (delivery.strftime("%Y%m%d"), delivery.strftime("%Y-%m-%d")),
+        )
+        ids.update(int(row["order_detail_id"]) for row in rows if row.get("order_detail_id"))
+    return ids
+
+
+def _dalian_shipment_fields_by_detail(detail_ids: list[int]) -> dict[int, dict[str, str]]:
+    clean = sorted({int(item) for item in detail_ids if item})
+    if not clean:
+        return {}
+    from app.api.v1.dalian_shipping_reservations import _ensure_tables as ensure_reservations
+
+    ensure_reservations()
+    placeholders = ", ".join(["%s"] * len(clean))
+    rows = fetch_all(
+        f"""
+        SELECT r.order_detail_id, r.planned_arrival_date, r.status, d.delivery_date
+        FROM dalian_shipping_reservations r
+        LEFT JOIN dalian_shipping_details d ON d.reservation_id = r.id
+        WHERE r.planned_qty > 0 AND r.order_detail_id IN ({placeholders})
+        """,
+        tuple(clean),
+    )
+    grouped: dict[int, dict[str, set[str]]] = {}
+    for row in rows:
+        detail_id = int(row["order_detail_id"])
+        bucket = grouped.setdefault(detail_id, {"planned": set(), "delivery": set(), "status": set()})
+        planned_text = _format_shipment_day(row.get("planned_arrival_date"))
+        delivery_text = _format_shipment_day(row.get("delivery_date"))
+        status_text = _normalize_str(row.get("status"))
+        if planned_text:
+            bucket["planned"].add(planned_text)
+        if delivery_text:
+            bucket["delivery"].add(delivery_text)
+        if status_text:
+            bucket["status"].add(status_text)
+    result: dict[int, dict[str, str]] = {}
+    for detail_id, bucket in grouped.items():
+        deliveries = sorted(bucket["delivery"])
+        result[detail_id] = {
+            "planned_arrival_date": "、".join(sorted(bucket["planned"])),
+            "actual_delivery_date": "、".join(deliveries),
+            "reservation_status": "、".join(sorted(bucket["status"])),
+        }
+    return result
+
+
 @router.post("/orders/query")
 def query_orders(req: QueryOrdersRequest):
     _ensure_order_details_loaded()
@@ -2813,9 +3090,12 @@ def query_orders(req: QueryOrdersRequest):
         warning = f"结果过多，仅返回最近{req.limit}条，请追加查询条件。"
 
     # 仅输入订单号时显示整个订单内容
+    shipment = _dalian_shipment_fields_by_detail([int(r["id"]) for r in data])
     grouped: dict[str, list[dict]] = {}
     for r in data:
-        grouped.setdefault(r["order_no"], []).append(r)
+        item = dict(r)
+        item.update(shipment.get(int(r["id"]), _empty_dalian_shipment_fields()))
+        grouped.setdefault(r["order_no"], []).append(item)
 
     return {"status": "success", "warning": warning, "total": len(data), "grouped": grouped}
 
@@ -2940,6 +3220,12 @@ def update_order_detail(req: OrderDetailUpdateRequest, user: UserDep):
     if idx is None:
         raise HTTPException(status_code=404, detail="未找到订单明细")
     before_row = dict(order_details[idx])
+    if before_row.get("split_group_id") and "quantity" in patch_sql:
+        if int(before_row.get("quantity") or 0) != int(patch_sql.get("quantity") or 0):
+            raise HTTPException(
+                status_code=400,
+                detail="该明细已按发货预定拆分，请在【合作伙伴/大连西门子】修改预定数量",
+            )
     if _has_packing_association_for_detail(before_row):
         for field in _PACKING_KEY_BLOCKED_FIELDS:
             if field not in patch_sql:
@@ -2998,7 +3284,8 @@ def update_order_detail(req: OrderDetailUpdateRequest, user: UserDep):
         "confirm_summary": req.confirm_summary,
     }
     _append_log_line(f"order_detail_change_{datetime.now().strftime('%Y-%m-%d')}.log", json.dumps(log_payload, ensure_ascii=False, default=str) + "\n")
-    return {"status": "success", "row": order_details[idx]}
+    typing = _sync_experiment_typing([after_row], {int(req.id): before_row}, user)
+    return {"status": "success", "row": order_details[idx], "typing": typing}
 
 
 @router.post("/orders/detail/append")
@@ -3110,7 +3397,8 @@ def append_order_detail(req: OrderDetailAppendRequest, user: UserDep):
         "snapshot": appended,
     }
     _append_log_line(f"order_detail_change_{datetime.now().strftime('%Y-%m-%d')}.log", json.dumps(log_payload, ensure_ascii=False, default=str) + "\n")
-    return {"status": "success", "row": appended, "packing_inserted": packing_inserted}
+    typing = _sync_experiment_typing([appended], {}, user) if appended else {"inserted_count": 0, "updated_count": 0, "error": None}
+    return {"status": "success", "row": appended, "packing_inserted": packing_inserted, "typing": typing}
 
 
 @router.post("/orders/split")
@@ -3152,6 +3440,22 @@ def split_order(req: SplitOrderRequest, user: UserDep):
         [(req.assign_mode, "分割", *update_audit_values(user), int(r["id"])) for r in target],
     )
     return {"status": "success", "order_no": req.order_no, "updated_count": len(target), "rows": target}
+
+
+def _sync_qty_map_dn(material_nos: list[str], operator: str = "") -> None:
+    from app.api.v1.france_auto_packing_qty_maps import apply_qty_map_dn_from_materials
+
+    apply_qty_map_dn_from_materials(material_nos, operator_name=operator)
+
+
+def _sync_experiment_typing(
+    updated_rows: list[dict],
+    before_map: dict[int, dict],
+    user: CurrentUser,
+) -> dict:
+    from app.services.typing_notice import sync_typing_after_experiment_change
+
+    return sync_typing_after_experiment_change(updated_rows, before_map, user)
 
 
 @router.post("/production/submit")
@@ -3216,7 +3520,7 @@ def load_production_rows(req: ProductionLoadRequest):
 
 
 @router.post("/production/batch-apply")
-def batch_apply_production(req: ProductionBatchApplyRequest):
+def batch_apply_production(req: ProductionBatchApplyRequest, user: UserDep):
     _ensure_order_details_loaded()
     target_keys = _production_target_keys(req.items)
     if not target_keys:
@@ -3228,30 +3532,39 @@ def batch_apply_production(req: ProductionBatchApplyRequest):
     order_no = _normalize_str(req.order_no)
     now = now_iso()
     updated = []
+    before_map: dict[int, dict] = {}
     for r in order_details:
         if order_no and r["order_no"] != order_no:
             continue
         if _order_detail_production_key(r) not in target_keys:
             continue
+        before_map[int(r["id"])] = {
+            "id": r["id"],
+            "order_no": r.get("order_no"),
+            "quantity": r.get("quantity"),
+            "heat_no": r.get("heat_no"),
+            "heat_treatment_batch_no": r.get("heat_treatment_batch_no"),
+        }
         if heat_no:
             r["heat_no"] = heat_no
         if batch_no:
             r["heat_treatment_batch_no"] = batch_no
-        r["updated_at"] = now
+        stamp_update(r, user, now)
         updated.append(r)
     if not updated:
         raise HTTPException(status_code=404, detail="未找到可批量应用的数据")
     execute_many(
-        """
+        f"""
         UPDATE order_details
         SET heat_no=CASE WHEN %s='' THEN heat_no ELSE %s END,
             heat_treatment_batch_no=CASE WHEN %s='' THEN heat_treatment_batch_no ELSE %s END,
-            updated_at=NOW()
+            {AUDIT_UPDATE_SET}
         WHERE id=%s
         """,
-        [(heat_no, heat_no, batch_no, batch_no, int(r["id"])) for r in updated],
+        [(heat_no, heat_no, batch_no, batch_no, *update_audit_values(user), int(r["id"])) for r in updated],
     )
-    return {"status": "success", "updated_count": len(updated), "rows": updated}
+    typing = _sync_experiment_typing(updated, before_map, user)
+    return {"status": "success", "updated_count": len(updated), "rows": updated, "typing": typing}
 
 
 @router.post("/production/confirm")
@@ -3290,14 +3603,15 @@ def confirm_production(req: ProductionConfirmRequest, user: UserDep):
         r["heat_treatment_batch_no"] = _normalize_str(row.get("heat_treatment_batch_no"))
         r["quantity"] = _safe_int(row.get("quantity"), int(r.get("quantity", 0) or 0))
         r["status"] = "加工"
-        r["updated_at"] = now
+        stamp_update(r, user, now)
         updated.append(r)
     if not updated:
         raise HTTPException(status_code=400, detail="没有可确认的数据")
     execute_many(
-        """
+        f"""
         UPDATE order_details
-        SET spec=%s, standard=%s, heat_no=%s, heat_treatment_batch_no=%s, quantity=%s, order_status=%s, updated_at=NOW()
+        SET spec=%s, standard=%s, heat_no=%s, heat_treatment_batch_no=%s, quantity=%s, order_status=%s,
+            {AUDIT_UPDATE_SET}
         WHERE id=%s
         """,
         [
@@ -3308,40 +3622,28 @@ def confirm_production(req: ProductionConfirmRequest, user: UserDep):
                 r["heat_treatment_batch_no"],
                 int(r.get("quantity", 0) or 0),
                 "加工",
+                *update_audit_values(user),
                 int(r["id"]),
             )
             for r in updated
         ],
     )
-    typing_notices: list[dict] = []
-    try:
-        from app.services.typing_notice import maybe_notify_experiment_typing_change
-
-        typing_notices = maybe_notify_experiment_typing_change(updated, before_map, user)
-    except Exception:
-        typing_notices = []
+    typing = _sync_experiment_typing(updated, before_map, user)
+    notices = typing.get("notices") or []
     notified_names = sorted(
         {
             str(item.get("owner_name") or "").strip()
-            for item in typing_notices
-            if item.get("created") or item.get("updated")
+            for item in notices
+            if (item.get("created") or item.get("updated")) and str(item.get("owner_name") or "").strip()
         }
     )
-    seen_orders: set[str] = set()
-    unaligned_count = 0
-    for item in typing_notices:
-        order_key = str(item.get("order_no") or "")
-        if not order_key or order_key in seen_orders:
-            continue
-        seen_orders.add(order_key)
-        unaligned_count += int(item.get("unaligned_count") or 0)
     return {
         "status": "success",
         "updated_count": len(updated),
         "rows": updated,
-        "typing_notices": typing_notices,
+        "typing": typing,
         "notified_names": notified_names,
-        "unaligned_count": unaligned_count,
+        "unaligned_count": int(typing.get("detail_count") or 0),
     }
 
 
@@ -3531,6 +3833,10 @@ def submit_materials(req: MaterialsSaveRequest):
             str(saved.get("material_no") or ""),
             str(saved.get("drawing_no") or ""),
         )
+    _sync_qty_map_dn(
+        [str(saved.get("material_no") or "") for saved in saved_rows],
+        operator,
+    )
     return {
         "status": "success",
         "saved_count": len(saved_rows),
@@ -3614,7 +3920,14 @@ def _enrich_qc_list_with_data_missing_flags(rows: list[dict]) -> list[dict]:
 
 
 @router.get("/qc/list")
-def qc_list(order_no: str = "", material_no: str = "", region: str = "", status: str = ""):
+def qc_list(
+    order_no: str = "",
+    material_no: str = "",
+    region: str = "",
+    status: str = "",
+    planned_arrival_date: str = "",
+    delivery_date: str = "",
+):
     _ensure_order_details_loaded()
     status_text = _normalize_str(status)
     if status_text:
@@ -3628,19 +3941,48 @@ def qc_list(order_no: str = "", material_no: str = "", region: str = "", status:
     if material_no:
         target = [r for r in target if material_no.lower() in r["material_no"].lower()]
     target = _filter_qc_rows_by_region(target, region)
-    enriched = [enrich_order_detail_with_snapshot(r) for r in target]
+    date_ids = _qc_detail_ids_for_dates(planned_arrival_date, delivery_date)
+    if date_ids is not None:
+        target = [r for r in target if int(r["id"]) in date_ids]
+    enriched = [enrich_order_detail_with_snapshot(dict(r)) for r in target]
+    shipment = _dalian_shipment_fields_by_detail([int(r["id"]) for r in enriched])
+    for row in enriched:
+        row.update(shipment.get(int(row["id"]), _empty_dalian_shipment_fields()))
     enriched = _enrich_qc_list_with_data_missing_flags(enriched)
     return {"status": "success", "total": len(enriched), "rows": enriched}
 
 
 @router.get("/qc/snapshots")
-def qc_snapshot_list(order_no: str = "", material_no: str = "", region: str = "", status: str = ""):
+def qc_snapshot_list(
+    order_no: str = "",
+    material_no: str = "",
+    region: str = "",
+    status: str = "",
+    planned_arrival_date: str = "",
+    delivery_date: str = "",
+):
     status_text = _normalize_str(status)
-    if not _normalize_str(order_no) and not _normalize_str(material_no) and not status_text:
-        raise HTTPException(status_code=400, detail="请至少填写订单号、物料号或状态")
+    date_ids = _qc_detail_ids_for_dates(planned_arrival_date, delivery_date)
+    has_date = date_ids is not None
+    if not _normalize_str(order_no) and not _normalize_str(material_no) and not status_text and not has_date:
+        raise HTTPException(status_code=400, detail="请至少填写订单号、物料号、状态或日期")
     if status_text and status_text not in ORDER_STATUSES:
         raise HTTPException(status_code=400, detail=f"非法订单状态: {status_text}")
-    rows = query_snapshots(region=region, order_no=order_no, material_no=material_no, status=status_text)
+    rows = query_snapshots(
+        region=region,
+        order_no=order_no,
+        material_no=material_no,
+        status=status_text,
+        order_detail_ids=list(date_ids) if date_ids is not None else None,
+    )
+    shipment = _dalian_shipment_fields_by_detail(
+        [int(row["order_detail_id"]) for row in rows if row.get("order_detail_id")]
+    )
+    for row in rows:
+        detail_id = row.get("order_detail_id")
+        if not detail_id:
+            continue
+        row.update(shipment.get(int(detail_id), _empty_dalian_shipment_fields()))
     return {"status": "success", "total": len(rows), "rows": rows}
 
 
@@ -4595,6 +4937,7 @@ def update_packing_factory_order_no(req: UpdateFactoryOrderNoRequest):
 @router.post("/packing/save")
 def save_packing_rows(req: PackingSaveRequest):
     _ensure_order_details_loaded()
+    _ensure_packing_details_schema()
     if req.deleted_ids:
         execute_many("DELETE FROM packing_details WHERE id=%s", [(int(x),) for x in req.deleted_ids])
     current_rows = _fetch_packing_rows_from_db(req.order_no)
@@ -4639,8 +4982,9 @@ def save_packing_rows(req: PackingSaveRequest):
                 INSERT INTO packing_details (
                     order_no, material_no, spec, standard, material, quantity, unit_weight, total_weight,
                     gross_weight, remark1, box_no, entry_no, box_length, box_width, box_height,
-                    packing_remark, delivery_date, packed_at
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    packing_remark, delivery_date, packed_at,
+                    created_by, created_by_user_id, updated_by, updated_by_user_id
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """,
                 (
                     req.order_no,
@@ -4659,6 +5003,10 @@ def save_packing_rows(req: PackingSaveRequest):
                     0,
                     0,
                     "",
+                    None,
+                    None,
+                    None,
+                    None,
                     None,
                     None,
                 ),
@@ -4712,6 +5060,7 @@ def get_material_for_packing(order_no: str, material_no: str):
 @router.post("/packing/submit")
 def submit_packing(req: PackingSubmitRequest):
     _ensure_order_details_loaded()
+    _ensure_packing_details_schema()
     current_rows = _fetch_packing_rows_from_db(req.order_no)
     if req.order_no not in packing_sessions:
         rows = _find_order(req.order_no)
@@ -5058,6 +5407,17 @@ def update_shipping_delivery_dates(req: UpdateDeliveryDateRequest):
         "UPDATE packing_details SET delivery_date=%s, updated_at=NOW() WHERE order_no=%s AND box_no=%s",
         [(delivery_date, req.order_no, box_no) for box_no, delivery_date in target.items()],
     )
+    from app.api.v1.customer_packing import _ensure_tables as _ensure_customer_packing
+
+    _ensure_customer_packing()
+    execute_many(
+        """
+        UPDATE france_customer_packing_list_items
+        SET actual_delivery_date=%s, updated_at=NOW()
+        WHERE TRIM(po)=%s AND box_no=%s
+        """,
+        [(delivery_date, req.order_no, box_no) for box_no, delivery_date in target.items()],
+    )
     return {"status": "success", "updated_count": updated}
 
 
@@ -5103,10 +5463,18 @@ def advance_shipping_status(req: AdvanceShippingStatusRequest):
 
 
 @router.get("/shipping/dalian/details")
-def get_dalian_shipping_details(delivery_date: str):
-    target_date = _validate_delivery_date_yyyymmdd(delivery_date)
-    rows = _fetch_dalian_rows_by_date(target_date)
-    return {"status": "success", "delivery_date": target_date, "rows": rows}
+def get_dalian_shipping_details(delivery_date: str = "", planned_arrival_date: str = ""):
+    target_date = _validate_delivery_date_yyyymmdd(delivery_date) if _normalize_str(delivery_date) else ""
+    planned = _parse_dalian_planned_date(planned_arrival_date) if _normalize_str(planned_arrival_date) else None
+    if not target_date and not planned:
+        raise HTTPException(status_code=400, detail="请填写预定到货日期或发货日期")
+    rows = _fetch_dalian_shipping_rows(delivery_date=target_date, planned_arrival_date=planned)
+    return {
+        "status": "success",
+        "delivery_date": target_date,
+        "planned_arrival_date": planned.strftime("%Y-%m-%d") if planned else "",
+        "rows": rows,
+    }
 
 
 @router.get("/shipping/dalian/max-id")
@@ -5210,12 +5578,12 @@ def submit_dalian_shipping_details(req: DalianShippingSubmitRequest):
 
 
 @router.post("/shipping/dalian/generate_mark")
-def generate_dalian_shipping_mark(req: DalianShippingGenerateMarkRequest):
-    target_date = _validate_delivery_date_yyyymmdd(req.delivery_date)
-    export_rows = _fetch_dalian_rows_by_date(target_date)
+def generate_dalian_shipping_mark(req: DalianShippingGenerateMarkRequest, user: UserDep):
+    target_date = _validate_delivery_date_yyyymmdd(req.header_date)
+    export_rows = _fetch_dalian_shipping_rows(ids=req.ids)
 
     if not export_rows:
-        raise HTTPException(status_code=404, detail=f"未找到发货日期 {target_date} 的发货明细，请先提交发货明细后再生成唛头")
+        raise HTTPException(status_code=404, detail="未找到可生成唛头的发货明细，请先查询确认")
 
     formatted_date = _format_dalian_mark_date(target_date)
     file_name = f"大连西门子唛头_{formatted_date}.xlsx"
@@ -5223,6 +5591,12 @@ def generate_dalian_shipping_mark(req: DalianShippingGenerateMarkRequest):
     try:
         wb = _build_dalian_mark_workbook(export_rows, target_date)
         wb.save(out_file)
+        from app.api.v1.dalian_shipping_reservations import mark_reservations_packed
+
+        mark_reservations_packed(
+            [int(row["reservation_id"]) for row in export_rows if row.get("reservation_id")],
+            user,
+        )
     except HTTPException:
         if out_file.exists():
             out_file.unlink(missing_ok=True)

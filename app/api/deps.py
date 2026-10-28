@@ -25,7 +25,7 @@ def get_accept_language(accept_language: str = Header(default="zh-CN")) -> str:
     return DEFAULT_LANG
 
 
-LAYOUT_MODES = frozenset({"horizontal", "vertical", "classic"})
+LAYOUT_MODES = frozenset({"horizontal", "vertical", "classic", "mix", "columns", "overview"})
 DEFAULT_LAYOUT_MODE = "horizontal"
 COLOR_THEMES = frozenset(
     {

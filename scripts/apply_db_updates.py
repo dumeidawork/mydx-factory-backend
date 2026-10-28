@@ -69,11 +69,22 @@ def main() -> None:
     from app.api.v1.dalian_econtract import CREATE_ITEM_SQL as DALIAN_ECONTRACT_ITEM_SQL, CREATE_LIST_SQL as DALIAN_ECONTRACT_LIST_SQL, CREATE_LOG_SQL as DALIAN_ECONTRACT_LOG_SQL, CREATE_ORDER_CONTRACT_SQL as DALIAN_ORDER_CONTRACT_SQL
     from app.api.v1.paint_requirements import CREATE_LOG_TABLE_SQL as PAINT_LOG_TABLE_SQL, CREATE_TABLE_SQL as PAINT_TABLE_SQL
     from app.api.v1.dn_inch_maps import CREATE_LOG_TABLE_SQL as DN_INCH_LOG_TABLE_SQL, CREATE_TABLE_SQL as DN_INCH_TABLE_SQL
+    from app.api.v1.drawing_flange_type_maps import CREATE_LOG_TABLE_SQL as DRAWING_FLANGE_LOG_TABLE_SQL, CREATE_TABLE_SQL as DRAWING_FLANGE_TABLE_SQL
+    from app.api.v1.pallet_archives import ALTER_BOX_WEIGHT_SQL as PALLET_ARCHIVE_BOX_WEIGHT_SQL, CREATE_LOG_TABLE_SQL as PALLET_ARCHIVE_LOG_TABLE_SQL, CREATE_TABLE_SQL as PALLET_ARCHIVE_TABLE_SQL
+    from app.api.v1.france_auto_packing_qty_maps import CREATE_LOG_TABLE_SQL as FRANCE_AUTO_PACK_QTY_LOG_SQL, CREATE_NOTICE_TABLE_SQL as FRANCE_AUTO_PACK_QTY_NOTICE_SQL, CREATE_TABLE_SQL as FRANCE_AUTO_PACK_QTY_TABLE_SQL, DALIAN_CREATE_LOG_TABLE_SQL, DALIAN_CREATE_TABLE_SQL
+    from app.api.v1.france_auto_packing import CREATE_LOG_TABLE_SQL as FRANCE_AUTO_PACK_LOG_SQL
+    from app.api.v1.dalian_packing import CREATE_LOG_TABLE_SQL as DALIAN_PACKING_LOG_SQL
     from app.api.v1.material_typing_maps import CREATE_LOG_TABLE_SQL as MATERIAL_TYPING_LOG_TABLE_SQL, CREATE_TABLE_SQL as MATERIAL_TYPING_TABLE_SQL
     from app.api.v1.typing_requirements import CREATE_LOG_TABLE_SQL as TYPING_LOG_TABLE_SQL, CREATE_TABLE_SQL as TYPING_TABLE_SQL
     from app.api.v1.qr_label_designs import CREATE_LOG_TABLE_SQL as QR_LABEL_LOG_TABLE_SQL, CREATE_TABLE_SQL as QR_LABEL_TABLE_SQL
     from app.services.license_schema import CREATE_LICENSE_CERTIFICATE_ITEMS_SQL, CREATE_LICENSE_DOCS_SQL
     from app.services.typing_notice import CREATE_TABLE_SQL as TYPING_NOTICE_TABLE_SQL
+    from app.api.v1.dalian_shipping_reservations import (
+        CREATE_DATE_SQL as DALIAN_SHIP_DATE_SQL,
+        CREATE_LOG_SQL as DALIAN_SHIP_LOG_SQL,
+        CREATE_RESERVATION_SQL as DALIAN_SHIP_RESERVATION_SQL,
+        CREATE_UNREAD_SQL as DALIAN_SHIP_UNREAD_SQL,
+    )
 
     create_statements.extend(
         [
@@ -95,6 +106,17 @@ def main() -> None:
             PAINT_LOG_TABLE_SQL,
             DN_INCH_TABLE_SQL,
             DN_INCH_LOG_TABLE_SQL,
+            DRAWING_FLANGE_TABLE_SQL,
+            DRAWING_FLANGE_LOG_TABLE_SQL,
+            PALLET_ARCHIVE_TABLE_SQL,
+            PALLET_ARCHIVE_LOG_TABLE_SQL,
+            FRANCE_AUTO_PACK_QTY_TABLE_SQL,
+            FRANCE_AUTO_PACK_QTY_LOG_SQL,
+            FRANCE_AUTO_PACK_QTY_NOTICE_SQL,
+            DALIAN_CREATE_TABLE_SQL,
+            DALIAN_CREATE_LOG_TABLE_SQL,
+            FRANCE_AUTO_PACK_LOG_SQL,
+            DALIAN_PACKING_LOG_SQL,
             MATERIAL_TYPING_TABLE_SQL,
             MATERIAL_TYPING_LOG_TABLE_SQL,
             TYPING_TABLE_SQL,
@@ -102,14 +124,20 @@ def main() -> None:
             TYPING_NOTICE_TABLE_SQL,
             QR_LABEL_TABLE_SQL,
             QR_LABEL_LOG_TABLE_SQL,
+            DALIAN_SHIP_RESERVATION_SQL,
+            DALIAN_SHIP_DATE_SQL,
+            DALIAN_SHIP_UNREAD_SQL,
+            DALIAN_SHIP_LOG_SQL,
         ]
     )
     alter_statements = [
-        ("users", "layout_mode", "ALTER TABLE users ADD COLUMN layout_mode VARCHAR(16) NOT NULL DEFAULT 'horizontal' COMMENT 'horizontal, vertical, classic' AFTER language_preference"),
+        ("users", "layout_mode", "ALTER TABLE users ADD COLUMN layout_mode VARCHAR(16) NOT NULL DEFAULT 'horizontal' COMMENT 'horizontal, vertical, classic, mix, columns, overview' AFTER language_preference"),
         ("users", "color_theme", "ALTER TABLE users ADD COLUMN color_theme VARCHAR(32) NOT NULL DEFAULT 'classic-blue' COMMENT 'user color theme id' AFTER layout_mode"),
         ("document_jobs", "file_name", "ALTER TABLE document_jobs ADD COLUMN file_name VARCHAR(255) NULL AFTER status"),
         ("order_details", "packed_at", "ALTER TABLE order_details ADD COLUMN packed_at DATETIME NULL AFTER finished_at"),
         ("order_details", "shipped_at", "ALTER TABLE order_details ADD COLUMN shipped_at DATETIME NULL AFTER packed_at"),
+        ("order_details", "split_group_id", "ALTER TABLE order_details ADD COLUMN split_group_id INT NULL COMMENT '部分发货拆分组，首次拆分时为原明细id' AFTER shipped_at"),
+        ("order_details", "contract_qty", "ALTER TABLE order_details ADD COLUMN contract_qty INT NULL COMMENT '拆分前合同数量，同组各行相同' AFTER split_group_id"),
         ("order_details", "factory_order_no", "ALTER TABLE order_details ADD COLUMN factory_order_no VARCHAR(128) NULL AFTER customer"),
         ("order_details", "item_no", "ALTER TABLE order_details ADD COLUMN item_no INT NULL AFTER seq"),
         ("order_details", "agreement_price", "ALTER TABLE order_details ADD COLUMN agreement_price DECIMAL(12,2) NOT NULL DEFAULT 0.00 COMMENT '协议价' AFTER total_weight"),
@@ -129,7 +157,28 @@ def main() -> None:
         ("materials", "product_unit_price", "ALTER TABLE materials ADD COLUMN product_unit_price DECIMAL(12,2) NOT NULL DEFAULT 0.00 COMMENT '产品单价' AFTER pt"),
         ("materials", "france_agreement_price", "ALTER TABLE materials ADD COLUMN france_agreement_price DECIMAL(12,2) NOT NULL DEFAULT 0.00 COMMENT '法国协议价' AFTER product_unit_price"),
         ("materials", "dalian_agreement_price", "ALTER TABLE materials ADD COLUMN dalian_agreement_price DECIMAL(12,2) NOT NULL DEFAULT 0.00 COMMENT '大连协议价' AFTER france_agreement_price"),
+        ("materials", "drawing_archive_id", "ALTER TABLE materials ADD COLUMN drawing_archive_id BIGINT NULL COMMENT '对应图纸建档 id' AFTER drawing_no"),
+        ("france_customer_packing_list_items", "box_no", "ALTER TABLE france_customer_packing_list_items ADD COLUMN box_no INT NULL COMMENT '主箱号（件数最多的箱）' AFTER match_warning"),
+        ("france_customer_packing_list_items", "actual_delivery_date", "ALTER TABLE france_customer_packing_list_items ADD COLUMN actual_delivery_date DATE NULL COMMENT '实际交货日期（与离港日分开）' AFTER box_no"),
+        ("packing_details", "created_by", "ALTER TABLE packing_details ADD COLUMN created_by VARCHAR(64) NULL COMMENT '上传者' AFTER updated_at"),
+        ("packing_details", "created_by_user_id", "ALTER TABLE packing_details ADD COLUMN created_by_user_id INT NULL COMMENT '上传者用户ID' AFTER created_by"),
+        ("packing_details", "updated_by", "ALTER TABLE packing_details ADD COLUMN updated_by VARCHAR(64) NULL COMMENT '更改者' AFTER created_by_user_id"),
+        ("packing_details", "updated_by_user_id", "ALTER TABLE packing_details ADD COLUMN updated_by_user_id INT NULL COMMENT '更改者用户ID' AFTER updated_by"),
         ("dalian_shipping_details", "factory_order_no", "ALTER TABLE dalian_shipping_details ADD COLUMN factory_order_no VARCHAR(128) NULL COMMENT '本厂单号' AFTER order_no"),
+        ("dalian_shipping_details", "created_by_user_id", "ALTER TABLE dalian_shipping_details ADD COLUMN created_by_user_id INT NULL COMMENT '上传者用户ID' AFTER created_by"),
+        ("dalian_shipping_details", "updated_by", "ALTER TABLE dalian_shipping_details ADD COLUMN updated_by VARCHAR(64) NULL COMMENT '更改者' AFTER created_by_user_id"),
+        ("dalian_shipping_details", "updated_by_user_id", "ALTER TABLE dalian_shipping_details ADD COLUMN updated_by_user_id INT NULL COMMENT '更改者用户ID' AFTER updated_by"),
+        ("dalian_shipping_details", "updated_at", "ALTER TABLE dalian_shipping_details ADD COLUMN updated_at TIMESTAMP NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更改时间' AFTER updated_by_user_id"),
+        ("dalian_shipping_details", "reservation_id", "ALTER TABLE dalian_shipping_details ADD COLUMN reservation_id BIGINT NULL COMMENT '发货预定行ID，手工粘贴行为空' AFTER id"),
+        ("dalian_shipping_details", "planned_arrival_date", "ALTER TABLE dalian_shipping_details ADD COLUMN planned_arrival_date DATE NULL COMMENT '预定到货日期' AFTER reservation_id"),
+        ("dalian_shipping_reservations", "item_no", "ALTER TABLE dalian_shipping_reservations ADD COLUMN item_no INT NULL COMMENT '条目，来自订单明细，箱单显示' AFTER material"),
+        ("dalian_shipping_reservations", "drawing_no", "ALTER TABLE dalian_shipping_reservations ADD COLUMN drawing_no VARCHAR(255) NOT NULL DEFAULT '' COMMENT '图纸号，来自订单明细，箱单显示' AFTER item_no"),
+        ("dalian_shipping_reservations", "unit_weight", "ALTER TABLE dalian_shipping_reservations ADD COLUMN unit_weight DECIMAL(12,2) NOT NULL DEFAULT 0.00 COMMENT '单重，来自订单明细，箱单显示' AFTER drawing_no"),
+        ("dalian_shipping_reservations", "total_weight", "ALTER TABLE dalian_shipping_reservations ADD COLUMN total_weight DECIMAL(12,2) NOT NULL DEFAULT 0.00 COMMENT '总重=单重×预定数量，箱单显示' AFTER unit_weight"),
+        ("dalian_shipping_date_assignments", "packing_generated_by", "ALTER TABLE dalian_shipping_date_assignments ADD COLUMN packing_generated_by VARCHAR(64) NULL COMMENT '箱单最后生成者' AFTER assigned_by_name"),
+        ("dalian_shipping_date_assignments", "packing_generated_by_user_id", "ALTER TABLE dalian_shipping_date_assignments ADD COLUMN packing_generated_by_user_id INT NULL COMMENT '箱单最后生成者用户ID' AFTER packing_generated_by"),
+        ("dalian_shipping_date_assignments", "packing_generated_at", "ALTER TABLE dalian_shipping_date_assignments ADD COLUMN packing_generated_at DATETIME NULL COMMENT '箱单最后生成时间' AFTER packing_generated_by_user_id"),
+        ("dalian_shipping_date_assignments", "packing_content_stale", "ALTER TABLE dalian_shipping_date_assignments ADD COLUMN packing_content_stale TINYINT NOT NULL DEFAULT 0 COMMENT '生成后预定内容已变，须重新生成才能开始装箱' AFTER packing_generated_at"),
         ("qc_records", "order_detail_id", "ALTER TABLE qc_records ADD COLUMN order_detail_id INT NULL AFTER certificate_path"),
         ("qc_records", "item_no", "ALTER TABLE qc_records ADD COLUMN item_no INT NULL AFTER order_detail_id"),
         ("qc_records", "item_no_key", "ALTER TABLE qc_records ADD COLUMN item_no_key INT NOT NULL DEFAULT 0 AFTER item_no"),
@@ -145,6 +194,7 @@ def main() -> None:
         ("price_split_france", "updated_by_user_id", "ALTER TABLE price_split_france ADD COLUMN updated_by_user_id INT NULL COMMENT '更改者用户ID' AFTER updated_by"),
         ("price_split_dalian", "created_by_user_id", "ALTER TABLE price_split_dalian ADD COLUMN created_by_user_id INT NULL COMMENT '上传者用户ID' AFTER created_by"),
         ("price_split_dalian", "updated_by_user_id", "ALTER TABLE price_split_dalian ADD COLUMN updated_by_user_id INT NULL COMMENT '更改者用户ID' AFTER updated_by"),
+        ("pallet_archives", "box_weight_kg", PALLET_ARCHIVE_BOX_WEIGHT_SQL),
         ("price_split_france", "is_valid", "ALTER TABLE price_split_france ADD COLUMN is_valid TINYINT NOT NULL DEFAULT 1 COMMENT '1有效 0无效历史' AFTER updated_at"),
         ("price_split_france", "valid_slot", "ALTER TABLE price_split_france ADD COLUMN valid_slot TINYINT NULL COMMENT '有效行=1，无效行=NULL' AFTER is_valid"),
         ("price_split_france", "price_change_remark", "ALTER TABLE price_split_france ADD COLUMN price_change_remark VARCHAR(500) NULL COMMENT '调价/建档说明' AFTER price_version"),
@@ -175,6 +225,7 @@ def main() -> None:
         ("workbench_typing_notices", "changed_rows", "ALTER TABLE workbench_typing_notices ADD COLUMN changed_rows TEXT NULL COMMENT '未对齐明细 JSON' AFTER owner_name"),
         ("workbench_typing_notices", "trigger_user_id", "ALTER TABLE workbench_typing_notices ADD COLUMN trigger_user_id INT NULL COMMENT '触发建档的操作人' AFTER owner_name"),
         ("workbench_typing_notices", "trigger_user_name", "ALTER TABLE workbench_typing_notices ADD COLUMN trigger_user_name VARCHAR(64) NULL AFTER trigger_user_id"),
+        ("dalian_econtract_order_contracts", "defer_contract", "ALTER TABLE dalian_econtract_order_contracts ADD COLUMN defer_contract TINYINT NOT NULL DEFAULT 0 COMMENT '1=合同后补未关联归档合同' AFTER contract_total_amount"),
     ]
 
     with get_db() as conn:
@@ -186,6 +237,18 @@ def main() -> None:
             if not has_column(cursor, table_name, column_name):
                 cursor.execute(stmt)
                 applied_alters += 1
+        if has_table(cursor, "dalian_econtract_lists"):
+            cursor.execute(
+                "ALTER TABLE dalian_econtract_lists "
+                "MODIFY contract_archive_id INT NOT NULL DEFAULT 0 COMMENT '关联客户合同 id，0表示整单后补'"
+            )
+            applied_alters += 1
+        if has_table(cursor, "dalian_econtract_order_contracts"):
+            cursor.execute(
+                "ALTER TABLE dalian_econtract_order_contracts "
+                "MODIFY contract_archive_id INT NOT NULL DEFAULT 0 COMMENT '关联客户合同 id，0表示后补未关联'"
+            )
+            applied_alters += 1
         if has_table(cursor, "heat_treatment_test_records"):
             if has_index(cursor, "heat_treatment_test_records", "uk_order_heat_batch"):
                 cursor.execute("ALTER TABLE heat_treatment_test_records DROP INDEX uk_order_heat_batch")
@@ -359,6 +422,15 @@ def main() -> None:
             ("table", "paint_requirement_logs"),
             ("table", "dn_inch_maps"),
             ("table", "dn_inch_map_logs"),
+            ("table", "drawing_flange_type_maps"),
+            ("table", "drawing_flange_type_map_logs"),
+            ("table", "pallet_archives"),
+            ("table", "pallet_archive_logs"),
+            ("table", "france_auto_packing_qty_maps"),
+            ("table", "france_auto_packing_qty_map_logs"),
+            ("table", "dalian_auto_packing_qty_maps"),
+            ("table", "dalian_auto_packing_qty_map_logs"),
+            ("table", "workbench_qty_map_dn_notices"),
             ("table", "material_typing_maps"),
             ("table", "material_typing_map_logs"),
             ("table", "typing_requirements"),
@@ -366,6 +438,10 @@ def main() -> None:
             ("table", "qr_label_designs"),
             ("table", "qr_label_design_logs"),
             ("table", "workbench_typing_notices"),
+            ("table", "dalian_shipping_reservations"),
+            ("table", "dalian_shipping_date_assignments"),
+            ("table", "dalian_shipping_progress_unreads"),
+            ("table", "dalian_shipping_reservation_logs"),
             ("column", "workbench_typing_notices.changed_rows"),
             ("column", "workbench_typing_notices.trigger_user_id"),
             ("column", "workbench_typing_notices.trigger_user_name"),
@@ -382,6 +458,7 @@ def main() -> None:
             ("column", "price_split_france.updated_by_user_id"),
             ("column", "price_split_dalian.created_by_user_id"),
             ("column", "price_split_dalian.updated_by_user_id"),
+            ("column", "pallet_archives.box_weight_kg"),
             ("column", "price_split_france.is_valid"),
             ("column", "price_split_dalian.is_valid"),
             ("column", "price_split_france.price_change_remark"),
@@ -391,6 +468,8 @@ def main() -> None:
             ("column", "document_jobs.file_name"),
             ("column", "order_details.packed_at"),
             ("column", "order_details.shipped_at"),
+            ("column", "order_details.split_group_id"),
+            ("column", "order_details.contract_qty"),
             ("column", "order_details.factory_order_no"),
             ("column", "order_details.item_no"),
             ("column", "packing_details.delivery_date"),
@@ -404,7 +483,26 @@ def main() -> None:
             ("column", "materials.product_unit_price"),
             ("column", "materials.france_agreement_price"),
             ("column", "materials.dalian_agreement_price"),
+            ("column", "materials.drawing_archive_id"),
+            ("column", "france_customer_packing_list_items.box_no"),
+            ("column", "france_customer_packing_list_items.actual_delivery_date"),
+            ("column", "packing_details.created_by"),
+            ("column", "packing_details.updated_by"),
+            ("table", "france_auto_packing_logs"),
             ("column", "dalian_shipping_details.factory_order_no"),
+            ("column", "dalian_shipping_details.created_by_user_id"),
+            ("column", "dalian_shipping_details.updated_by"),
+            ("column", "dalian_shipping_details.reservation_id"),
+            ("column", "dalian_shipping_details.planned_arrival_date"),
+            ("table", "dalian_packing_operation_logs"),
+            ("column", "dalian_shipping_reservations.item_no"),
+            ("column", "dalian_shipping_reservations.drawing_no"),
+            ("column", "dalian_shipping_reservations.unit_weight"),
+            ("column", "dalian_shipping_reservations.total_weight"),
+            ("column", "dalian_shipping_date_assignments.packing_generated_by"),
+            ("column", "dalian_shipping_date_assignments.packing_generated_by_user_id"),
+            ("column", "dalian_shipping_date_assignments.packing_generated_at"),
+            ("column", "dalian_shipping_date_assignments.packing_content_stale"),
             ("column", "france_customer_packing_lists.factory_order_no"),
             ("column", "france_customer_packing_lists.customer"),
             ("column", "qc_records.order_detail_id"),
@@ -414,6 +512,7 @@ def main() -> None:
             ("column", "qc_records.cert_daily_seq"),
             ("column", "qc_records.certificate_type"),
             ("column", "dalian_certificate_allocations.order_detail_id"),
+            ("column", "dalian_econtract_order_contracts.defer_contract"),
             ("missing_column", "heat_treatment_test_records.order_no"),
         ]
         verified = []
@@ -426,9 +525,27 @@ def main() -> None:
             else:
                 table_name, column_name = name.split(".", 1)
                 verified.append(f"{name}={'REMOVED' if not has_column(cursor, table_name, column_name) else 'STILL_EXISTS'}")
+        if has_table(cursor, "dalian_shipping_details") and not has_index(cursor, "dalian_shipping_details", "uk_dsd_reservation_packing"):
+            cursor.execute(
+                "ALTER TABLE dalian_shipping_details ADD UNIQUE KEY uk_dsd_reservation_packing (reservation_id, packing_no)"
+            )
+            applied_alters += 1
+        if has_table(cursor, "dalian_shipping_details") and not has_index(cursor, "dalian_shipping_details", "idx_dsd_planned_arrival"):
+            cursor.execute("ALTER TABLE dalian_shipping_details ADD INDEX idx_dsd_planned_arrival (planned_arrival_date)")
+            applied_alters += 1
+        if has_table(cursor, "order_details") and not has_index(cursor, "order_details", "idx_order_details_split_group"):
+            cursor.execute("ALTER TABLE order_details ADD INDEX idx_order_details_split_group (split_group_id)")
+            applied_alters += 1
+        if has_table(cursor, "materials") and not has_index(cursor, "materials", "idx_material_drawing_archive"):
+            cursor.execute("ALTER TABLE materials ADD INDEX idx_material_drawing_archive (drawing_archive_id)")
+            applied_alters += 1
         cursor.close()
 
+    from app.services.material_drawing_link import backfill_material_drawing_archive_ids
+
+    backfill = backfill_material_drawing_archive_ids()
     print(f"Applied {len(create_statements)} create statements and {applied_alters} alter statements.")
+    print(f"Material drawing backfill: linked={backfill.get('linked')} unmatched={backfill.get('unmatched')}")
     print("Verification: " + ", ".join(verified))
 
 

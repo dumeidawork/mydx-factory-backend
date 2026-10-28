@@ -219,6 +219,38 @@ class QrLabelRenderTest(unittest.TestCase):
         )
         self.assertEqual(filled, "1PFDK-1+K20001")
 
+    def test_render_pdf_label_border_follows_print_settings(self):
+        base = {
+            "width_mm": 70,
+            "height_mm": 32,
+            "modules": [],
+            "print": {
+                "paper": "A4",
+                "orientation": "landscape",
+                "cols": 1,
+                "rows": 1,
+                "gap_x_mm": 0,
+                "gap_y_mm": 0,
+                "margin_mm": 5,
+            },
+        }
+        item = [{"material_no": "FDK-1", "quantity": 1}]
+        import fitz
+
+        def drawings_for(design):
+            pdf = render_label_pdf(design, item)
+            doc = fitz.open(stream=pdf, filetype="pdf")
+            try:
+                return doc[0].get_drawings()
+            finally:
+                doc.close()
+
+        off = drawings_for(base)
+        self.assertFalse(any(abs((d.get("width") or 0) - 0.75) < 1e-6 and d.get("color") == (0, 0, 0) for d in off))
+
+        on = drawings_for({**base, "print": {**base["print"], "border_enabled": True, "border_width_px": 1}})
+        self.assertTrue(any(abs((d.get("width") or 0) - 0.75) < 1e-6 and d.get("color") == (0, 0, 0) for d in on))
+
     def test_render_pdf_two_pages(self):
         design = {
             "width_mm": 70,

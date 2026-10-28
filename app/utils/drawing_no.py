@@ -75,6 +75,17 @@ def normalize_drawing_input(raw: str) -> str:
     return text
 
 
+def drawing_no_base(raw: str) -> str:
+    """对照/匹配用：去掉版本号，只留图纸号本体。"""
+    text = normalize_drawing_input(raw)
+    if not text:
+        return ""
+    match = _REV_SPLIT.search(text)
+    if match:
+        return text[: match.start()].strip()
+    return text
+
+
 def drawing_no_in_sql(column: str, raw: str) -> tuple[str, tuple[str, ...]]:
     """等值查询：兼容原文 / Rev 形 / 连字符形。"""
     variants = drawing_no_match_variants(raw)

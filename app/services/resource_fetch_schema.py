@@ -43,3 +43,21 @@ CREATE TABLE IF NOT EXISTS resource_fetch_download_logs (
     INDEX idx_rf_dl_user (downloaded_by_user_id)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='资材获取下载动态'
 """
+
+CREATE_RESOURCE_FETCH_WRITE_LOGS_SQL = """
+CREATE TABLE IF NOT EXISTS resource_fetch_write_logs (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    root_id BIGINT NOT NULL COMMENT '根目录ID',
+    root_name VARCHAR(128) NOT NULL DEFAULT '' COMMENT '操作时的根目录显示名',
+    rel_path VARCHAR(1024) NOT NULL DEFAULT '' COMMENT '相对根目录的路径',
+    file_name VARCHAR(255) NOT NULL DEFAULT '' COMMENT '文件或文件夹名',
+    item_kind VARCHAR(16) NOT NULL DEFAULT 'file' COMMENT 'file / dir / archive',
+    action VARCHAR(16) NOT NULL DEFAULT 'upload' COMMENT 'upload / mkdir',
+    created_by VARCHAR(64) NOT NULL DEFAULT '',
+    created_by_user_id INT NULL,
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    INDEX idx_rf_wl_time (created_at),
+    INDEX idx_rf_wl_root (root_id, created_at),
+    INDEX idx_rf_wl_user (created_by_user_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='资材获取上传与建文件夹动态'
+"""

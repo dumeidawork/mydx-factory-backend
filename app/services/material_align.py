@@ -249,6 +249,7 @@ def _load_drawing_for_align(material_no: str, drawing_no: str) -> dict | None:
     return fetch_one(
         f"""
         SELECT
+            id,
             TRIM(material_no) AS material_no,
             TRIM(drawing_no) AS drawing_no,
             TRIM(COALESCE(drawing_rev_no, '')) AS drawing_rev_no,
@@ -365,6 +366,10 @@ def _align_one(drawing_no: str, material_no: str, operator: str) -> dict[str, An
             sets.append("unit_weight=%s")
             params.append(weight)
             fields.append("unit_weight")
+        if drawing.get("id"):
+            sets.append("drawing_archive_id=%s")
+            params.append(int(drawing["id"]))
+            fields.append("drawing_archive_id")
 
     has_france_price = False
     if france:
@@ -437,6 +442,16 @@ def align_confirm(
             aligned.append(result)
         else:
             missing.append(result)
+    if aligned:
+        try:
+            from app.api.v1.france_auto_packing_qty_maps import apply_qty_map_dn_from_materials
+
+            apply_qty_map_dn_from_materials(
+                [str(item.get("material_no") or "") for item in aligned],
+                operator_name=operator,
+            )
+        except Exception:
+            pass
     return {
         "status": "success",
         "aligned_count": len(aligned),

@@ -21,7 +21,7 @@ from app.core.config import get_settings
 from app.core.database import ping_database
 from app.core.file_log import append_log_line
 from app.core.paths import get_storage_dir
-from app.api.v1 import auth, contract_archives, customer_packing, dalian_econtract, documents, drawing_archives, dn_inch_maps, finance, heat_treatment, license, material_typing_maps, operations, paint_requirements, price_split, qr_label_designs, resource_fetch, typing_requirements, warehouse, workbench, workflow
+from app.api.v1 import auth, contract_archives, customer_packing, dalian_auto_packing_qty_maps, dalian_econtract, dalian_packing, dalian_shipping_reservations, documents, drawing_archives, drawing_flange_type_maps, dn_inch_maps, finance, france_auto_packing, france_auto_packing_qty_maps, heat_treatment, license, material_typing_maps, operations, paint_requirements, pallet_archives, price_split, qr_label_designs, resource_fetch, typing_requirements, warehouse, workbench, workflow
 
 settings = get_settings()
 LOG_DIR = get_storage_dir() / "logs"
@@ -130,6 +130,11 @@ app.include_router(workflow.router, prefix="/api/v1")
 app.include_router(price_split.router, prefix="/api/v1")
 app.include_router(paint_requirements.router, prefix="/api/v1")
 app.include_router(dn_inch_maps.router, prefix="/api/v1")
+app.include_router(drawing_flange_type_maps.router, prefix="/api/v1")
+app.include_router(pallet_archives.router, prefix="/api/v1")
+app.include_router(france_auto_packing_qty_maps.router, prefix="/api/v1")
+app.include_router(dalian_auto_packing_qty_maps.router, prefix="/api/v1")
+app.include_router(france_auto_packing.router, prefix="/api/v1")
 app.include_router(material_typing_maps.router, prefix="/api/v1")
 app.include_router(typing_requirements.router, prefix="/api/v1")
 app.include_router(qr_label_designs.router, prefix="/api/v1")
@@ -137,6 +142,8 @@ app.include_router(heat_treatment.router, prefix="/api/v1")
 app.include_router(license.router, prefix="/api/v1")
 app.include_router(resource_fetch.router, prefix="/api/v1")
 app.include_router(warehouse.router, prefix="/api/v1")
+app.include_router(dalian_shipping_reservations.router, prefix="/api/v1")
+app.include_router(dalian_packing.router, prefix="/api/v1")
 app.include_router(workbench.router, prefix="/api/v1")
 
 

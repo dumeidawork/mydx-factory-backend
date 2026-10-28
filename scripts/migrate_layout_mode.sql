@@ -1,4 +1,4 @@
--- 用户布局偏好：horizontal / vertical / classic
+-- 用户布局偏好：horizontal / vertical / classic / mix / columns / overview
 SET NAMES utf8mb4;
 USE mingyuan_erp;
 
@@ -11,7 +11,7 @@ SET @col_exists := (
 
 SET @sql := IF(
     @col_exists = 0,
-    'ALTER TABLE users ADD COLUMN layout_mode VARCHAR(16) NOT NULL DEFAULT ''horizontal'' COMMENT ''horizontal, vertical, classic'' AFTER language_preference',
+    'ALTER TABLE users ADD COLUMN layout_mode VARCHAR(16) NOT NULL DEFAULT ''horizontal'' COMMENT ''horizontal, vertical, classic, mix, columns, overview'' AFTER language_preference',
     'SELECT 1'
 );
 PREPARE stmt FROM @sql;

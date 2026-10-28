@@ -19,7 +19,7 @@ from docx.oxml.ns import qn
 from app.core.database import execute, fetch_all, fetch_one
 from app.core.paths import get_templates_dir
 from app.services.license_schema import CREATE_LICENSE_CERTIFICATE_ITEMS_SQL, CREATE_LICENSE_DOCS_SQL
-from app.services.template_renderer import render_docx_template, render_xlsx_template
+from app.services.template_renderer import render_docx_template, render_placeholder_text, render_xlsx_template
 
 GRADE_A105 = "A105"
 GRADE_304 = "304"
@@ -75,6 +75,14 @@ OUTPUT_CERTIFICATE = {
     GRADE_304: "{order_no}量合格证书（不锈钢）_304.docx",
     GRADE_316: "{order_no}量合格证书（不锈钢）_316.docx",
 }
+
+TRANSPORT_AIR = "air"
+TRANSPORT_SEA = "sea"
+BANK_INVOICE_FILENAME = {
+    "CS": "PO{order_no} invoice-银行.xlsx",
+    "SS": "PO{order_no}-2 invoice-银行.xlsx",
+}
+_BANK_NUMERIC_KEYS = ("class_weight", "class_amount", "unit_price")
 
 _TABLES_READY = False
 
@@ -198,7 +206,7 @@ def parse_batch_date(value: date | datetime | str | None) -> date:
             return datetime.strptime(text, fmt).date()
         except ValueError:
             continue
-    raise ValueError("批量年月日格式无效，请使用 YYYY-MM-DD")
+    raise ValueError("年月日格式无效，请使用 YYYY-MM-DD")
 
 
 def _po_variants(order_no: str) -> tuple[str, str, str]:
@@ -750,6 +758,130 @@ def build_license_zip(
             user_name=user_name,
         )
 
+        fd, zip_name = tempfile.mkstemp(suffix=".zip")
+        os.close(fd)
+        zip_path = Path(zip_name)
+        with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            for name, path in produced:
+                zf.write(path, arcname=name)
+        return zip_path, [name for name, _path in produced]
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def bank_invoice_template(transport: str, material_class: str) -> Path:
+    if transport == TRANSPORT_AIR:
+        mode = "ByAir"
+    elif transport == TRANSPORT_SEA:
+        mode = "BySea"
+    else:
+        raise ValueError("请选择空运或海运")
+    if material_class not in ("CS", "SS"):
+        raise ValueError("银行发票材质类无效")
+    return _template_dir() / "02-BankInvoice" / mode / material_class / f"{mode}_{material_class}_Invoice-Bank.xlsx"
+
+
+def _bank_invoice_mapping(
+    order_no: str,
+    batch_date_value: date,
+    material_class: str,
+    summary: dict[str, Any],
+) -> dict[str, Any]:
+    if material_class == "CS":
+        amount, weight, unit_price = summary["cs_amount"], summary["cs_weight"], summary["cs_unit_price"]
+    else:
+        amount, weight, unit_price = summary["ss_amount"], summary["ss_weight"], summary["ss_unit_price"]
+    return {
+        "order_no": order_no,
+        "batch_date": batch_date_value.strftime("%Y-%m-%d"),
+        "class_weight": weight,
+        "class_amount": amount,
+        "unit_price": unit_price,
+    }
+
+
+def _fill_bank_invoice_sheet(ws, mapping: dict[str, Any]) -> None:
+    text_mapping = {
+        key: "" if value is None else str(value)
+        for key, value in mapping.items()
+    }
+    for row in ws.iter_rows():
+        for cell in row:
+            raw = cell.value
+            if not isinstance(raw, str) or "{{" not in raw:
+                continue
+            matched = None
+            for key in _BANK_NUMERIC_KEYS:
+                token = "{{" + key + "}}"
+                if raw.strip() == token:
+                    matched = key
+                    break
+            if matched:
+                value = mapping.get(matched)
+                cell.value = None if value is None else float(value)
+                continue
+            cell.value = render_placeholder_text(raw, text_mapping)
+
+
+def render_bank_invoice(
+    *,
+    order_no: str,
+    transport: str,
+    material_class: str,
+    summary: dict[str, Any],
+    batch_date_value: date,
+    output_path: Path,
+) -> None:
+    template = _require_template(bank_invoice_template(transport, material_class))
+    from openpyxl import load_workbook
+
+    wb = load_workbook(template)
+    _fill_bank_invoice_sheet(
+        wb.active,
+        _bank_invoice_mapping(order_no, batch_date_value, material_class, summary),
+    )
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    wb.save(output_path)
+
+
+def build_bank_invoice_files(
+    *,
+    order_no: str,
+    transport: str,
+    batch_date_value: date,
+    loaded: dict[str, Any] | None = None,
+) -> tuple[Path, list[str]]:
+    if transport not in (TRANSPORT_AIR, TRANSPORT_SEA):
+        raise ValueError("请选择空运或海运")
+    if loaded is None:
+        loaded = load_license_rows(order_no)
+    if not loaded["has_source"]:
+        raise ValueError("订单号未出现在法国客户箱单或订单明细中")
+    summary = summarize_rows(loaded["items"])
+    digits = str(loaded["order_no"])
+    classes: list[str] = []
+    if summary["by_grade"][GRADE_A105]:
+        classes.append("CS")
+    if summary["by_grade"][GRADE_304] or summary["by_grade"][GRADE_316]:
+        classes.append("SS")
+    if not classes:
+        raise ValueError("没有可生成的银行发票：订单不含 A105/304/316")
+
+    work = Path(tempfile.mkdtemp(prefix="license_bank_"))
+    produced: list[tuple[str, Path]] = []
+    try:
+        for material_class in classes:
+            name = BANK_INVOICE_FILENAME[material_class].format(order_no=digits)
+            path = work / name
+            render_bank_invoice(
+                order_no=digits,
+                transport=transport,
+                material_class=material_class,
+                summary=summary,
+                batch_date_value=batch_date_value,
+                output_path=path,
+            )
+            produced.append((name, path))
         fd, zip_name = tempfile.mkstemp(suffix=".zip")
         os.close(fd)
         zip_path = Path(zip_name)

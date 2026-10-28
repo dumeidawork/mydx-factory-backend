@@ -126,6 +126,8 @@ class PrintSettings(BaseModel):
     gap_x_mm: float = 1
     gap_y_mm: float = 1
     margin_mm: float = 5
+    border_enabled: bool = False
+    border_width_px: float = 1
 
 
 class DesignPayload(BaseModel):
@@ -192,6 +194,15 @@ def _normalize_str(value: Any) -> str:
 
 def _snap(value: float) -> float:
     return round(float(value) * 2) / 2
+
+
+def _clamp_border_px(value: float | None) -> float:
+    try:
+        width = float(value if value is not None else 1)
+    except (TypeError, ValueError):
+        width = 1.0
+    snapped = round(width * 2) / 2
+    return max(0.5, min(8.0, snapped))
 
 
 def _snap_tenth(value: float) -> float:
@@ -363,6 +374,8 @@ def validate_design(payload: DesignPayload) -> tuple[list[dict[str, Any]], dict[
         "gap_x_mm": gap_x,
         "gap_y_mm": gap_y,
         "margin_mm": margin,
+        "border_enabled": bool(print_in.border_enabled),
+        "border_width_px": _clamp_border_px(print_in.border_width_px),
     }
     return modules, print_out
 
@@ -381,6 +394,8 @@ def default_print(width_mm: float, height_mm: float) -> dict[str, Any]:
         "gap_x_mm": gap,
         "gap_y_mm": gap,
         "margin_mm": margin,
+        "border_enabled": False,
+        "border_width_px": 1.0,
     }
 
 
@@ -399,12 +414,24 @@ def _row_from_db(row: dict[str, Any] | None) -> dict[str, Any]:
     if not row:
         return {}
     modules = _parse_json(row.get("layout_json"), [])
+    width_mm = float(row.get("width_mm") or 0)
+    height_mm = float(row.get("height_mm") or 0)
     print_settings = _parse_json(row.get("print_json"), default_print(70, 32))
+    if not isinstance(print_settings, dict):
+        print_settings = default_print(width_mm or 70, height_mm or 32)
+    else:
+        base = default_print(width_mm or 70, height_mm or 32)
+        print_settings = {
+            **base,
+            **print_settings,
+            "border_enabled": bool(print_settings.get("border_enabled")),
+            "border_width_px": _clamp_border_px(print_settings.get("border_width_px")),
+        }
     return {
         "id": int(row["id"]),
         "name": _normalize_str(row.get("name")),
-        "width_mm": float(row.get("width_mm") or 0),
-        "height_mm": float(row.get("height_mm") or 0),
+        "width_mm": width_mm,
+        "height_mm": height_mm,
         "modules": modules,
         "print": print_settings,
         "created_by": _normalize_str(row.get("created_by")),

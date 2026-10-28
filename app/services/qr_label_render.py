@@ -283,8 +283,22 @@ def _draw_label(
 ) -> None:
     width = _mm(float(design.get("width_mm") or 0))
     height = _mm(float(design.get("height_mm") or 0))
-    box = fitz.Rect(origin_x, origin_y, origin_x + width, origin_y + height)
-    page.draw_rect(box, color=(0.75, 0.75, 0.75), width=0.2)
+    settings = design.get("print") or {}
+    if bool(settings.get("border_enabled")):
+        try:
+            border_px = float(settings.get("border_width_px") or 1)
+        except (TypeError, ValueError):
+            border_px = 1.0
+        border_px = max(0.5, min(8.0, round(border_px * 2) / 2))
+        stroke_pt = border_px * 72.0 / 96.0
+        inset = stroke_pt / 2
+        box = fitz.Rect(
+            origin_x + inset,
+            origin_y + inset,
+            origin_x + width - inset,
+            origin_y + height - inset,
+        )
+        page.draw_rect(box, color=(0, 0, 0), width=stroke_pt)
     values = item_values(item)
     for mod in design.get("modules") or []:
         mtype = mod.get("type")

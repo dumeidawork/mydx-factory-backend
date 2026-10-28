@@ -298,12 +298,19 @@ def query_snapshots(
     order_no: str = "",
     material_no: str = "",
     status: str = "",
+    order_detail_ids: list[int] | None = None,
 ) -> list[dict[str, Any]]:
     """查询快照列表，按 region / order_no / material_no / order_details 状态 过滤。"""
     conditions: list[str] = []
     params: list[Any] = []
     join_order_details = bool(_normalize_str(status))
     table_prefix = "s." if join_order_details else ""
+    if order_detail_ids is not None:
+        if not order_detail_ids:
+            return []
+        placeholders = ", ".join(["%s"] * len(order_detail_ids))
+        conditions.append(f"{table_prefix}order_detail_id IN ({placeholders})")
+        params.extend(int(item) for item in order_detail_ids)
 
     if order_no:
         conditions.append(f"{table_prefix}order_no = %s")

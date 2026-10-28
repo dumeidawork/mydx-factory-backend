@@ -4,7 +4,7 @@ from __future__ import annotations
 from pathlib import Path
 from urllib.parse import quote
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 from starlette.background import BackgroundTask
@@ -15,8 +15,6 @@ from app.services import resource_fetch_service as svc
 
 router = APIRouter(prefix="/resource-fetch", tags=["资材获取"])
 UserDep = Annotated[CurrentUser, Depends(get_current_user)]
-
-_ADMIN_ROLES = frozenset({"super_admin", "general_manager"})
 
 
 class RootCreateRequest(BaseModel):
@@ -37,8 +35,14 @@ class RootUpdateRequest(BaseModel):
     allowed_role_ids: list[int] | None = None
 
 
+class MkdirRequest(BaseModel):
+    root_id: int = Field(..., ge=1)
+    rel: str = ""
+    name: str = Field(..., min_length=1, max_length=255)
+
+
 def _require_admin(user: CurrentUser) -> None:
-    if user.role_code not in _ADMIN_ROLES:
+    if not svc.user_is_admin(user):
         raise HTTPException(status_code=403, detail="仅管理员可执行此操作")
 
 
@@ -122,6 +126,37 @@ def admin_delete_root(root_id: int, user: UserDep):
     _require_admin(user)
     svc.delete_root(root_id)
     return {"ok": True}
+
+
+@router.post("/admin/mkdir")
+def admin_mkdir(body: MkdirRequest, user: UserDep):
+    _require_admin(user)
+    item = svc.create_subdir(body.root_id, body.rel, body.name, user)
+    return {"item": item}
+
+
+@router.post("/admin/upload")
+async def admin_upload(
+    user: UserDep,
+    root_id: int = Form(..., ge=1),
+    rel: str = Form(default=""),
+    file: UploadFile = File(...),
+):
+    _require_admin(user)
+    item = await svc.save_uploaded_file(root_id=root_id, rel=rel, upload=file, user=user)
+    return {"item": item}
+
+
+@router.get("/admin/write-logs")
+def admin_write_logs(
+    user: UserDep,
+    root_id: int | None = Query(default=None, ge=1),
+    q: str = Query(default=""),
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+):
+    _require_admin(user)
+    return svc.list_write_logs(user, root_id=root_id, keyword=q, limit=limit, offset=offset)
 
 
 @router.get("/browse")

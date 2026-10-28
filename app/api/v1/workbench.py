@@ -7,8 +7,11 @@ from typing_extensions import Annotated
 
 from app.api.deps import CurrentUser, get_current_user
 from app.api.v1.contract_archives import get_pending_amount_confirm_items, get_pending_takeover_items
+from app.api.v1.dalian_econtract import get_pending_dalian_contract_defer_items
 from app.api.v1.drawing_archives import get_pending_review_items, get_pending_revise_items
 from app.services.material_align import get_pending_material_drawing_items, get_pending_material_price_items
+from app.api.v1.france_auto_packing_qty_maps import get_pending_qty_map_dn_notice_items
+from app.api.v1.dalian_shipping_reservations import get_dalian_shipping_progress
 from app.services.typing_notice import (
     confirm_typing_notice,
     generate_from_typing_notice,
@@ -27,6 +30,9 @@ def list_pending(user: Annotated[CurrentUser, Depends(get_current_user)]):
     material_drawing_items = get_pending_material_drawing_items(user.id)
     material_price_items = get_pending_material_price_items(user.id)
     typing_notice_items = get_pending_typing_notice_items(user.id)
+    dalian_contract_defer_items = get_pending_dalian_contract_defer_items(user.id)
+    qty_map_dn_items = get_pending_qty_map_dn_notice_items(user.id)
+    dalian_shipping_progress = get_dalian_shipping_progress(user.id)
     return {
         "items": items,
         "amount_items": amount_items,
@@ -35,6 +41,9 @@ def list_pending(user: Annotated[CurrentUser, Depends(get_current_user)]):
         "material_drawing_items": material_drawing_items,
         "material_price_items": material_price_items,
         "typing_notice_items": typing_notice_items,
+        "dalian_contract_defer_items": dalian_contract_defer_items,
+        "qty_map_dn_items": qty_map_dn_items,
+        "dalian_shipping_progress": dalian_shipping_progress,
         "count": (
             len(items)
             + len(amount_items)
@@ -43,6 +52,8 @@ def list_pending(user: Annotated[CurrentUser, Depends(get_current_user)]):
             + len(material_drawing_items)
             + len(material_price_items)
             + len(typing_notice_items)
+            + len(dalian_contract_defer_items)
+            + len(qty_map_dn_items)
         ),
     }
 

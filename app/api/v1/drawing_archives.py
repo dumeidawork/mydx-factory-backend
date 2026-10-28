@@ -707,7 +707,7 @@ def _collect_payload(
     }
 
 
-def _upsert_material(payload: dict[str, str], operator: str) -> str:
+def _upsert_material(payload: dict[str, str], operator: str, drawing_archive_id: int | None = None) -> str:
     from app.api.v1.workflow import upsert_material_from_drawing
 
     material_no = payload["material_no"] or payload["name_fourth"]
@@ -722,6 +722,7 @@ def _upsert_material(payload: dict[str, str], operator: str) -> str:
         material=payload["material"],
         unit_weight=_parse_unit_weight(payload["unit_weight"]),
         operator=operator,
+        drawing_archive_id=drawing_archive_id,
     )
 
 
@@ -854,7 +855,7 @@ async def upload_drawing(
             abs_path.unlink(missing_ok=True)
         raise
 
-    material_action = _upsert_material(payload, user.name)
+    material_action = _upsert_material(payload, user.name, new_id)
     row = _get_archive_or_404(new_id)
     _write_log(
         new_id,
@@ -1373,7 +1374,7 @@ async def update_drawing(
     if delete_old is not None and delete_old.is_file():
         delete_old.unlink(missing_ok=True)
 
-    material_action = _upsert_material(payload, user.name)
+    material_action = _upsert_material(payload, user.name, archive_id)
     marked = 0
     if old_status == STATUS_REVIEWED:
         from app.api.v1.workflow import mark_pending_doc_status_for_drawing_no
@@ -1413,7 +1414,7 @@ def revise_drawing(
         raise HTTPException(status_code=403, detail="仅上传者可以修改该图纸数据")
     payload = _apply_revise_fields(row, body)
     _update_archive_fields(archive_id, payload, user)
-    material_action = _upsert_material(payload, user.name)
+    material_action = _upsert_material(payload, user.name, archive_id)
     after_row = _get_archive_or_404(archive_id)
     _write_log(
         archive_id,
@@ -1441,7 +1442,7 @@ def resubmit_drawing(
         raise HTTPException(status_code=403, detail="仅上传者可以重新提交")
     payload = _apply_revise_fields(row, body)
     _update_archive_fields(archive_id, payload, user)
-    material_action = _upsert_material(payload, user.name)
+    material_action = _upsert_material(payload, user.name, archive_id)
     execute(
         """
         UPDATE drawing_archives

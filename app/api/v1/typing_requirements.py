@@ -373,7 +373,7 @@ def _row_from_db(row: dict[str, Any] | None) -> dict[str, Any]:
         "id": int(row["id"]),
         "order_no": _normalize_str(row.get("order_no")),
         "factory_order_no": _normalize_str(row.get("factory_order_no")),
-        "order_detail_id": row.get("order_detail_id"),
+        "order_detail_id": int(row["order_detail_id"]) if row.get("order_detail_id") else None,
         "item_no": row.get("item_no"),
         "seq": row.get("seq"),
         "drawing_rev_no": _normalize_str(row.get("drawing_rev_no")),
@@ -1304,7 +1304,11 @@ def _build_export_workbook(order_no: str, factory_order_no: str, rows: list[dict
 
 
 @router.get("/export")
-def export_typing_requirements(user: UserDep, order_no: str = Query(..., min_length=1)):
+def export_typing_requirements(
+    user: UserDep,
+    order_no: str = Query(..., min_length=1),
+    ids: list[int] = Query(default=[]),
+):
     import io
 
     from fastapi.responses import StreamingResponse
@@ -1315,6 +1319,11 @@ def export_typing_requirements(user: UserDep, order_no: str = Query(..., min_len
     rows = _list_rows(order_no)
     if not rows:
         raise HTTPException(status_code=404, detail=f"订单号 {order_no} 还没有打字要求，请先点「生成」")
+    id_set = {int(item) for item in ids if int(item) > 0}
+    if id_set:
+        rows = [row for row in rows if int(row.get("id") or 0) in id_set]
+        if not rows:
+            raise HTTPException(status_code=404, detail="所选范围内没有可导出的打字要求")
     factory_order_no = _pick_first(*[r.get("factory_order_no") for r in rows])
 
     wb, missing_cells = _build_export_workbook(order_no, factory_order_no, rows)
@@ -1337,6 +1346,7 @@ def export_typing_requirements(user: UserDep, order_no: str = Query(..., min_len
             "file_name": file_name,
             "row_count": len(rows),
             "missing_cell_count": missing_cells,
+            "ids": sorted(id_set),
         },
     )
     return StreamingResponse(

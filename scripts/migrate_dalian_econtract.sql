@@ -3,7 +3,7 @@
 
 CREATE TABLE IF NOT EXISTS dalian_econtract_lists (
     id BIGINT AUTO_INCREMENT PRIMARY KEY,
-    contract_archive_id INT NOT NULL COMMENT '关联客户合同 id',
+    contract_archive_id INT NOT NULL DEFAULT 0 COMMENT '关联客户合同 id，0表示整单后补',
     contract_file_name VARCHAR(255) NOT NULL DEFAULT '' COMMENT '关联合同文件名快照',
     contract_version VARCHAR(32) NOT NULL DEFAULT '' COMMENT '关联合同版本号快照',
     source_file_name VARCHAR(255) NOT NULL DEFAULT '' COMMENT '上传时的文件名（不存原件）',
@@ -74,10 +74,11 @@ CREATE TABLE IF NOT EXISTS dalian_econtract_order_contracts (
     id BIGINT AUTO_INCREMENT PRIMARY KEY,
     list_id BIGINT NOT NULL COMMENT '电子合同主表 id',
     order_no VARCHAR(64) NOT NULL COMMENT '订单号',
-    contract_archive_id INT NOT NULL COMMENT '关联客户合同 id',
+    contract_archive_id INT NOT NULL DEFAULT 0 COMMENT '关联客户合同 id，0表示后补未关联',
     contract_file_name VARCHAR(255) NOT NULL DEFAULT '' COMMENT '合同文件名快照',
     contract_version VARCHAR(32) NOT NULL DEFAULT '' COMMENT '合同版本号快照',
     contract_total_amount DECIMAL(14,2) NULL COMMENT '关联时的合同总金额',
+    defer_contract TINYINT NOT NULL DEFAULT 0 COMMENT '1=合同后补未关联归档合同',
     UNIQUE KEY uk_decl_oc_list_order (list_id, order_no),
     INDEX idx_decl_oc_list (list_id),
     INDEX idx_decl_oc_contract (contract_archive_id)

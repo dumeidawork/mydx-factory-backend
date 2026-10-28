@@ -220,6 +220,23 @@ def _render_item_row_values(template_values: list[Any], item: dict[str, Any]) ->
     return row_values
 
 
+def _shift_images_below(ws: Worksheet, insert_at: int, extra: int) -> None:
+    """插入明细行后，把锚点落在插入行及以下的图片（电子图章）下移同样行数。"""
+    if extra <= 0:
+        return
+    threshold = insert_at - 1
+    for image in getattr(ws, "_images", []):
+        anchor = getattr(image, "anchor", None)
+        if anchor is None:
+            continue
+        markers = [getattr(anchor, "_from", None), getattr(anchor, "to", None)]
+        for marker in markers:
+            if marker is None or getattr(marker, "row", None) is None:
+                continue
+            if int(marker.row) >= threshold:
+                marker.row = int(marker.row) + extra
+
+
 def _copy_cell_style(source, dest) -> None:
     dest.font = copy(source.font)
     dest.border = copy(source.border)
@@ -247,18 +264,24 @@ def _expand_item_template_rows(ws: Worksheet, template_row: int, items: list[dic
         for idx, height in original_heights.items():
             dest = idx + extra if idx >= insert_at else idx
             ws.row_dimensions[dest].height = height
-        for min_row, min_col, max_row, max_col in original_merges:
-            if min_row >= insert_at:
-                min_row += extra
-                max_row += extra
-            elif max_row >= insert_at:
-                max_row += extra
-            ws.merge_cells(start_row=min_row, start_column=min_col, end_row=max_row, end_column=max_col)
+        for merge_min_row, merge_min_col, merge_max_row, merge_max_col in original_merges:
+            if merge_min_row >= insert_at:
+                merge_min_row += extra
+                merge_max_row += extra
+            elif merge_max_row >= insert_at:
+                merge_max_row += extra
+            ws.merge_cells(
+                start_row=merge_min_row,
+                start_column=merge_min_col,
+                end_row=merge_max_row,
+                end_column=merge_max_col,
+            )
         for offset in range(1, extra + 1):
             dest_row = template_row + offset
             ws.row_dimensions[dest_row].height = template_height
             for col in range(1, max_col + 1):
                 _copy_cell_style(ws.cell(template_row, col), ws.cell(dest_row, col))
+        _shift_images_below(ws, insert_at, extra)
     for index, item in enumerate(items):
         values = _render_item_row_values(template_values, item)
         dest_row = template_row + index

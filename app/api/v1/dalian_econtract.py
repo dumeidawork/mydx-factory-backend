@@ -14,9 +14,9 @@ from typing_extensions import Annotated
 from app.api.deps import CurrentUser, get_current_user
 from app.api.v1.customer_packing import (
     OrderContractIn,
+    _column_exists,
     _contract_hit,
     _load_own_contract,
-    _validate_order_contract_mappings,
 )
 from app.core.database import execute, fetch_all, fetch_one
 from app.services.dalian_econtract_parser import parse_dalian_econtract_workbook
@@ -30,19 +30,21 @@ from app.services.order_detail_audit import (
     stamp_create,
     write_op_log as write_order_detail_op_log,
 )
-from app.utils.drawing_no import drawing_no_match_variants, normalize_drawing_input
+from app.utils.drawing_no import drawing_no_base, drawing_no_match_variants, normalize_drawing_input
+from app.api.v1.drawing_flange_type_maps import load_flange_type_map, lookup_flange_type
 
 router = APIRouter(prefix="/customer-packing", tags=["客户箱单/电子合同录入"])
 UserDep = Annotated[CurrentUser, Depends(get_current_user)]
 
 _TABLES_READY = False
+_SCHEMA_PATCHED = False
 ALLOWED_EXT = {".xlsx", ".xls"}
 PRICE_TOLERANCE = 0.01
 
 CREATE_LIST_SQL = """
 CREATE TABLE IF NOT EXISTS dalian_econtract_lists (
     id BIGINT AUTO_INCREMENT PRIMARY KEY,
-    contract_archive_id INT NOT NULL COMMENT '关联客户合同 id',
+    contract_archive_id INT NOT NULL DEFAULT 0 COMMENT '关联客户合同 id，0表示整单后补',
     contract_file_name VARCHAR(255) NOT NULL DEFAULT '' COMMENT '关联合同文件名快照',
     contract_version VARCHAR(32) NOT NULL DEFAULT '' COMMENT '关联合同版本号快照',
     source_file_name VARCHAR(255) NOT NULL DEFAULT '' COMMENT '上传时的文件名（不存原件）',
@@ -119,10 +121,11 @@ CREATE TABLE IF NOT EXISTS dalian_econtract_order_contracts (
     id BIGINT AUTO_INCREMENT PRIMARY KEY,
     list_id BIGINT NOT NULL COMMENT '电子合同主表 id',
     order_no VARCHAR(64) NOT NULL COMMENT '订单号',
-    contract_archive_id INT NOT NULL COMMENT '关联客户合同 id',
+    contract_archive_id INT NOT NULL DEFAULT 0 COMMENT '关联客户合同 id，0表示后补未关联',
     contract_file_name VARCHAR(255) NOT NULL DEFAULT '' COMMENT '合同文件名快照',
     contract_version VARCHAR(32) NOT NULL DEFAULT '' COMMENT '合同版本号快照',
     contract_total_amount DECIMAL(14,2) NULL COMMENT '关联时的合同总金额',
+    defer_contract TINYINT NOT NULL DEFAULT 0 COMMENT '1=合同后补未关联归档合同',
     UNIQUE KEY uk_decl_oc_list_order (list_id, order_no),
     INDEX idx_decl_oc_list (list_id),
     INDEX idx_decl_oc_contract (contract_archive_id)
@@ -197,16 +200,47 @@ class GenerateOrdersRequest(BaseModel):
     confirm_warnings: bool = False
 
 
+def _ensure_schema_patches() -> None:
+    global _SCHEMA_PATCHED
+    if _SCHEMA_PATCHED:
+        return
+    if _column_exists("dalian_econtract_order_contracts", "contract_archive_id") and not _column_exists(
+        "dalian_econtract_order_contracts", "defer_contract"
+    ):
+        execute(
+            """
+            ALTER TABLE dalian_econtract_order_contracts
+            ADD COLUMN defer_contract TINYINT NOT NULL DEFAULT 0
+            COMMENT '1=合同后补未关联归档合同' AFTER contract_total_amount
+            """
+        )
+    if _column_exists("dalian_econtract_lists", "contract_archive_id"):
+        execute(
+            """
+            ALTER TABLE dalian_econtract_lists
+            MODIFY contract_archive_id INT NOT NULL DEFAULT 0 COMMENT '关联客户合同 id，0表示整单后补'
+            """
+        )
+    if _column_exists("dalian_econtract_order_contracts", "contract_archive_id"):
+        execute(
+            """
+            ALTER TABLE dalian_econtract_order_contracts
+            MODIFY contract_archive_id INT NOT NULL DEFAULT 0 COMMENT '关联客户合同 id，0表示后补未关联'
+            """
+        )
+    _SCHEMA_PATCHED = True
+
+
 def _ensure_tables() -> None:
     global _TABLES_READY
     execute(CREATE_ORDER_CONTRACT_SQL)
-    if _TABLES_READY:
-        return
-    execute(CREATE_LIST_SQL)
-    execute(CREATE_ITEM_SQL)
-    execute(CREATE_LOG_SQL)
-    execute(CREATE_ORDER_CONTRACT_SQL)
-    _TABLES_READY = True
+    if not _TABLES_READY:
+        execute(CREATE_LIST_SQL)
+        execute(CREATE_ITEM_SQL)
+        execute(CREATE_LOG_SQL)
+        execute(CREATE_ORDER_CONTRACT_SQL)
+        _TABLES_READY = True
+    _ensure_schema_patches()
 
 
 def _jsonable(value: Any) -> Any:
@@ -261,6 +295,33 @@ def _load_list(list_id: int) -> dict:
     return row
 
 
+def _deferred_contract_hit(order_no: str = "") -> dict[str, Any]:
+    return {
+        "contract_archive_id": 0,
+        "id": 0,
+        "order_no": order_no,
+        "file_name": "",
+        "version": "",
+        "contract_file_name": "",
+        "contract_version": "",
+        "customer_name": "",
+        "owner_name": "",
+        "owner_user_id": None,
+        "total_amount": None,
+        "contract_total_amount_live": None,
+        "can_link": False,
+        "defer_contract": True,
+    }
+
+
+def _is_deferred_mapping(hit: dict | None) -> bool:
+    if not hit:
+        return False
+    if hit.get("defer_contract"):
+        return int(hit.get("contract_archive_id") or hit.get("id") or 0) <= 0
+    return int(hit.get("contract_archive_id") or hit.get("id") or 0) <= 0
+
+
 def _load_order_contracts(list_id: int) -> list[dict]:
     rows = fetch_all(
         """
@@ -271,8 +332,15 @@ def _load_order_contracts(list_id: int) -> list[dict]:
     )
     out: list[dict] = []
     for row in rows:
-        hit = _contract_hit(int(row["contract_archive_id"]))
-        hit["order_no"] = str(row.get("order_no") or "").strip()
+        order_no = str(row.get("order_no") or "").strip()
+        archive_id = int(row.get("contract_archive_id") or 0)
+        defer = int(row.get("defer_contract") or 0) == 1 and archive_id <= 0
+        if defer:
+            out.append(_deferred_contract_hit(order_no))
+            continue
+        hit = _contract_hit(archive_id)
+        hit["order_no"] = order_no
+        hit["defer_contract"] = False
         hit["contract_file_name"] = str(row.get("contract_file_name") or hit.get("file_name") or "")
         hit["contract_version"] = str(row.get("contract_version") or hit.get("version") or "")
         if hit.get("total_amount") is None and row.get("contract_total_amount") is not None:
@@ -282,17 +350,18 @@ def _load_order_contracts(list_id: int) -> list[dict]:
 
 
 def _legacy_order_contracts(header: dict, items: list[dict]) -> list[dict]:
-    archive_id = header.get("contract_archive_id")
-    if not archive_id:
-        return []
+    archive_id = int(header.get("contract_archive_id") or 0)
     order_nos = sorted(
         {str(it.get("order_no") or "").strip() for it in items if str(it.get("order_no") or "").strip()}
     )
     if not order_nos:
         return []
-    hit = _contract_hit(int(archive_id))
+    if archive_id <= 0:
+        return [_deferred_contract_hit(order_no) for order_no in order_nos]
+    hit = _contract_hit(archive_id)
     hit["contract_file_name"] = hit.get("file_name") or str(header.get("contract_file_name") or "")
     hit["contract_version"] = hit.get("version") or str(header.get("contract_version") or "")
+    hit["defer_contract"] = False
     return [{**hit, "order_no": order_no} for order_no in order_nos]
 
 
@@ -306,22 +375,107 @@ def _resolve_order_contracts(header: dict, items: list[dict]) -> list[dict]:
 def _replace_order_contracts(list_id: int, mappings: list[tuple[str, dict]]) -> None:
     execute("DELETE FROM dalian_econtract_order_contracts WHERE list_id=%s", (list_id,))
     for order_no, contract in mappings:
-        total = contract.get("total_amount")
+        defer = bool(contract.get("defer_contract"))
+        archive_id = 0 if defer else int(contract.get("id") or 0)
+        total = None if defer else contract.get("total_amount")
         execute(
             """
             INSERT INTO dalian_econtract_order_contracts
-                (list_id, order_no, contract_archive_id, contract_file_name, contract_version, contract_total_amount)
-            VALUES (%s, %s, %s, %s, %s, %s)
+                (list_id, order_no, contract_archive_id, contract_file_name, contract_version,
+                 contract_total_amount, defer_contract)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
             """,
             (
                 list_id,
                 order_no,
-                int(contract["id"]),
-                str(contract.get("file_name") or ""),
-                str(contract.get("version") or ""),
+                archive_id,
+                "" if defer else str(contract.get("file_name") or ""),
+                "" if defer else str(contract.get("version") or ""),
                 None if total is None else _round2(total),
+                1 if defer else 0,
             ),
         )
+
+
+def _validate_dalian_order_contract_mappings(
+    order_nos: list[str],
+    req_mappings: list[OrderContractIn],
+    user: CurrentUser,
+) -> list[tuple[str, dict]]:
+    if not order_nos:
+        raise HTTPException(status_code=400, detail="没有有效订单号，无法关联合同")
+    by_order: dict[str, OrderContractIn] = {}
+    for item in req_mappings:
+        key = str(item.order_no or "").strip()
+        if key:
+            by_order[key] = item
+    missing = [order_no for order_no in order_nos if order_no not in by_order]
+    if missing:
+        raise HTTPException(status_code=400, detail=f"以下订单号尚未关联合同或打开合同后补：{'、'.join(missing)}")
+    used: dict[int, str] = {}
+    result: list[tuple[str, dict]] = []
+    for order_no in order_nos:
+        item = by_order[order_no]
+        archive_id = int(item.contract_archive_id or 0)
+        if archive_id > 0:
+            prior = used.get(archive_id)
+            if prior and prior != order_no:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"合同 #{archive_id} 已关联订单号 {prior}，每个订单号须对应不同合同文件",
+                )
+            used[archive_id] = order_no
+            loaded = dict(_load_own_contract(archive_id, user))
+            loaded["defer_contract"] = False
+            result.append((order_no, loaded))
+            continue
+        if item.defer_contract:
+            result.append((order_no, _deferred_contract_hit(order_no)))
+            continue
+        raise HTTPException(status_code=400, detail=f"订单号 {order_no} 尚未关联合同")
+    return result
+
+
+def get_pending_dalian_contract_defer_items(user_id: int) -> list[dict]:
+    _ensure_tables()
+    rows = fetch_all(
+        """
+        SELECT
+            l.id AS list_id,
+            l.factory_order_no,
+            l.customer,
+            l.source_file_name,
+            l.created_at,
+            l.updated_at,
+            GROUP_CONCAT(oc.order_no ORDER BY oc.order_no SEPARATOR '、') AS order_nos
+        FROM dalian_econtract_lists l
+        JOIN dalian_econtract_order_contracts oc ON oc.list_id = l.id
+        WHERE l.created_by_user_id = %s
+          AND oc.defer_contract = 1
+          AND IFNULL(oc.contract_archive_id, 0) = 0
+        GROUP BY l.id, l.factory_order_no, l.customer, l.source_file_name, l.created_at, l.updated_at
+        ORDER BY l.updated_at DESC, l.id DESC
+        """,
+        (user_id,),
+    )
+    items: list[dict] = []
+    for row in rows:
+        order_nos = row.get("order_nos") or ""
+        if isinstance(order_nos, bytes):
+            order_nos = order_nos.decode("utf-8", errors="ignore")
+        items.append(
+            {
+                "id": int(row["list_id"]),
+                "list_id": int(row["list_id"]),
+                "factory_order_no": str(row.get("factory_order_no") or ""),
+                "customer": str(row.get("customer") or ""),
+                "source_file_name": str(row.get("source_file_name") or ""),
+                "order_nos": str(order_nos),
+                "created_at": _jsonable(row.get("created_at")),
+                "updated_at": _jsonable(row.get("updated_at")),
+            }
+        )
+    return items
 
 
 def _load_items(list_id: int) -> list[dict]:
@@ -625,7 +779,7 @@ def _list_payload(row: dict, items: list[dict] | None = None) -> dict:
     payload = _row_to_dict(row)
     payload["items"] = items if items is not None else _load_items(int(row["id"]))
     payload["order_contracts"] = _resolve_order_contracts(row, payload["items"])
-    first = payload["order_contracts"][0] if payload["order_contracts"] else None
+    first = next((item for item in payload["order_contracts"] if not _is_deferred_mapping(item)), None)
     if first:
         payload["customer_name"] = first.get("customer_name")
         payload["owner_name"] = first.get("owner_name")
@@ -745,8 +899,9 @@ def save_dalian_econtract(req: SaveEcontractRequest, user: UserDep):
     mappings = list(req.order_contracts)
     if not mappings and req.contract_archive_id:
         mappings = [OrderContractIn(order_no=no, contract_archive_id=req.contract_archive_id) for no in order_nos]
-    loaded_maps = _validate_order_contract_mappings(order_nos, mappings, user)
-    contract = loaded_maps[0][1]
+    loaded_maps = _validate_dalian_order_contract_mappings(order_nos, mappings, user)
+    linked_maps = [(no, contract) for no, contract in loaded_maps if not contract.get("defer_contract")]
+    contract = linked_maps[0][1] if linked_maps else {"id": 0, "file_name": "", "version": ""}
     checked_at = datetime.now()
     overwrite_ids = _find_overwrite_ids(order_nos)
     keep_id = overwrite_ids[0] if overwrite_ids else None
@@ -767,7 +922,7 @@ def save_dalian_econtract(req: SaveEcontractRequest, user: UserDep):
             WHERE id=%s
             """,
             (
-                int(contract["id"]),
+                int(contract.get("id") or 0),
                 str(contract.get("file_name") or ""),
                 str(contract.get("version") or ""),
                 req.source_file_name or "",
@@ -793,7 +948,7 @@ def save_dalian_econtract(req: SaveEcontractRequest, user: UserDep):
             ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             """,
             (
-                int(contract["id"]),
+                int(contract.get("id") or 0),
                 str(contract.get("file_name") or ""),
                 str(contract.get("version") or ""),
                 req.source_file_name or "",
@@ -820,8 +975,15 @@ def save_dalian_econtract(req: SaveEcontractRequest, user: UserDep):
         action,
         list_id=list_id,
         change_summary={
-            "contract_archive_id": int(contract["id"]),
-            "order_contracts": [{"order_no": no, "contract_archive_id": int(c["id"])} for no, c in loaded_maps],
+            "contract_archive_id": int(contract.get("id") or 0),
+            "order_contracts": [
+                {
+                    "order_no": no,
+                    "contract_archive_id": int(c.get("id") or 0),
+                    "defer_contract": bool(c.get("defer_contract")),
+                }
+                for no, c in loaded_maps
+            ],
             "order_nos": order_nos,
             "count": len(req.items),
             "overwritten": old_summaries,
@@ -995,6 +1157,8 @@ def generate_dalian_orders(list_id: int, req: GenerateOrdersRequest, user: UserD
         raise HTTPException(status_code=400, detail="客户不能为空，请先保存整单")
 
     warnings = []
+    seen_orders: set[str] = set()
+    flange_by_drawing = load_flange_type_map()
     for idx, item in enumerate(items, start=1):
         if not str(item.get("material_no") or "").strip():
             warnings.append(f"第{idx}行物料号为空")
@@ -1005,12 +1169,20 @@ def generate_dalian_orders(list_id: int, req: GenerateOrdersRequest, user: UserD
             warnings.append(f"第{idx}行订单号【{order_no}】不是 4 开头（大连订单）")
         if int(item.get("multi_drawing") or 0) and not int(item.get("drawing_confirmed") or 0):
             warnings.append(f"第{idx}行存在多个图纸版本未确认")
-        if not str(item.get("drawing_no") or "").strip():
+        drawing_raw = str(item.get("drawing_no") or "").strip()
+        if not drawing_raw:
             warnings.append(f"第{idx}行未匹配图纸号")
+        elif not lookup_flange_type(drawing_raw, flange_by_drawing):
+            warnings.append(f"第{idx}行图纸号未匹配法兰类型（{drawing_no_base(drawing_raw)}）")
         if int(item.get("price_mismatch") or 0):
             warnings.append(f"第{idx}行单价与拆分表/物料协议价不一致")
         if float(item.get("excel_unit_price") or 0) == 0:
             warnings.append(f"第{idx}行 Excel 单价为 0")
+        if order_no and order_no not in seen_orders:
+            seen_orders.add(order_no)
+            hit = by_order.get(order_no)
+            if hit and _is_deferred_mapping(hit):
+                warnings.append(f"订单号 {order_no} 合同后补未关联")
     if warnings and not req.confirm_warnings:
         raise HTTPException(status_code=400, detail={"message": "生成前请确认以下问题", "warnings": warnings})
 
@@ -1024,7 +1196,11 @@ def generate_dalian_orders(list_id: int, req: GenerateOrdersRequest, user: UserD
         raise HTTPException(status_code=400, detail="没有有效的订单号，无法生成订单")
     for order_no in grouped:
         hit = by_order.get(order_no)
-        if not hit or not hit.get("contract_archive_id"):
+        if not hit:
+            raise HTTPException(status_code=400, detail=f"订单号 {order_no} 未关联合同")
+        if _is_deferred_mapping(hit):
+            continue
+        if not hit.get("contract_archive_id"):
             raise HTTPException(status_code=400, detail=f"订单号 {order_no} 未关联合同")
         owner_id = int(hit.get("owner_user_id") or 0)
         if owner_id != int(user.id):
@@ -1062,6 +1238,7 @@ def generate_dalian_orders(list_id: int, req: GenerateOrdersRequest, user: UserD
             unit_weight = _round2(item.get("unit_weight") or 0)
             total_weight = calc_total_weight(unit_weight, quantity)
             excel_price = _round2(item.get("excel_unit_price") or 0)
+            remark1 = lookup_flange_type(drawing_no, flange_by_drawing)
             record_id = execute(
                 f"""
                 INSERT INTO order_details (
@@ -1089,7 +1266,7 @@ def generate_dalian_orders(list_id: int, req: GenerateOrdersRequest, user: UserD
                     total_weight,
                     excel_price,
                     excel_price,
-                    str(item.get("remark1") or ""),
+                    remark1,
                     "",
                     "",
                     "",
@@ -1121,6 +1298,7 @@ def generate_dalian_orders(list_id: int, req: GenerateOrdersRequest, user: UserD
                 "total_weight": total_weight,
                 "agreement_price": excel_price,
                 "product_unit_price": excel_price,
+                "remark1": remark1,
                 "status": "开始",
                 "doc_status": doc_status,
                 "upload_type": "文件上传",

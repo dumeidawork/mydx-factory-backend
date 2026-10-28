@@ -23,7 +23,7 @@ CREATE TABLE IF NOT EXISTS users (
     department VARCHAR(64),
     phone VARCHAR(32),
     language_preference VARCHAR(10) DEFAULT 'zh-CN' COMMENT 'zh-CN, en-US, ja-JP',
-    layout_mode VARCHAR(16) NOT NULL DEFAULT 'horizontal' COMMENT 'horizontal, vertical, classic',
+    layout_mode VARCHAR(16) NOT NULL DEFAULT 'horizontal' COMMENT 'horizontal, vertical, classic, mix, columns, overview',
     color_theme VARCHAR(32) NOT NULL DEFAULT 'classic-blue' COMMENT 'user color theme id',
     username VARCHAR(64) UNIQUE,
     password_hash VARCHAR(255),
@@ -189,6 +189,8 @@ CREATE TABLE IF NOT EXISTS order_details (
     finished_at DATETIME,
     packed_at DATETIME,
     shipped_at DATETIME,
+    split_group_id INT NULL COMMENT '部分发货拆分组，首次拆分时为原明细id',
+    contract_qty INT NULL COMMENT '拆分前合同数量，同组各行相同',
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
     created_by VARCHAR(64) NULL COMMENT '上传者',
@@ -197,7 +199,8 @@ CREATE TABLE IF NOT EXISTS order_details (
     updated_by_user_id INT NULL COMMENT '更改者用户ID',
     INDEX idx_order_no (order_no),
     INDEX idx_material_no (material_no),
-    INDEX idx_status (order_status)
+    INDEX idx_status (order_status),
+    INDEX idx_order_details_split_group (split_group_id)
 );
 
 CREATE TABLE IF NOT EXISTS order_detail_operation_logs (
@@ -524,3 +527,92 @@ CREATE TABLE IF NOT EXISTS workbench_typing_notices (
     INDEX idx_typing_notice_owner_status (owner_user_id, status),
     INDEX idx_typing_notice_order (order_no)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='实验建档变动打字要求工作台通知';
+
+CREATE TABLE IF NOT EXISTS dalian_shipping_reservations (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    order_detail_id INT NOT NULL COMMENT '订单明细ID',
+    order_no VARCHAR(64) NOT NULL DEFAULT '' COMMENT '订单号快照',
+    factory_order_no VARCHAR(128) NOT NULL DEFAULT '' COMMENT '本厂单号快照',
+    part_no VARCHAR(128) NOT NULL DEFAULT '' COMMENT '料号快照',
+    material_no VARCHAR(128) NOT NULL DEFAULT '' COMMENT '物料号快照',
+    spec_model VARCHAR(256) NOT NULL DEFAULT '' COMMENT '规格型号快照',
+    material VARCHAR(64) NOT NULL DEFAULT '' COMMENT '材质快照',
+    item_no INT NULL COMMENT '条目，来自订单明细，箱单显示',
+    drawing_no VARCHAR(255) NOT NULL DEFAULT '' COMMENT '图纸号，来自订单明细，箱单显示',
+    unit_weight DECIMAL(12,2) NOT NULL DEFAULT 0.00 COMMENT '单重，来自订单明细，箱单显示',
+    total_weight DECIMAL(12,2) NOT NULL DEFAULT 0.00 COMMENT '总重=单重×预定数量，箱单显示',
+    order_qty INT NOT NULL DEFAULT 0 COMMENT '保存时订单数量快照',
+    planned_arrival_date DATE NOT NULL COMMENT '预定到货日期',
+    planned_qty INT NOT NULL DEFAULT 0 COMMENT '预定到货数量，0=该日取消留痕',
+    remark VARCHAR(255) NOT NULL DEFAULT '' COMMENT '备注',
+    status VARCHAR(32) NOT NULL DEFAULT '已预定' COMMENT '已预定/已指定对接/存在变更内容/开始装箱/已装箱/已发货',
+    booker_user_id INT NULL COMMENT '预定者用户ID',
+    booker_name VARCHAR(64) NOT NULL DEFAULT '' COMMENT '预定者',
+    booked_at DATETIME NULL COMMENT '预定时间',
+    assignee_user_id INT NULL COMMENT '对接人员用户ID',
+    assignee_name VARCHAR(64) NOT NULL DEFAULT '' COMMENT '对接人员',
+    assigned_at DATETIME NULL COMMENT '指定对接时间',
+    assigned_by_user_id INT NULL COMMENT '指定人用户ID',
+    assigned_by_name VARCHAR(64) NOT NULL DEFAULT '' COMMENT '指定人',
+    created_by VARCHAR(64) NULL COMMENT '上传者',
+    created_by_user_id INT NULL COMMENT '上传者用户ID',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP COMMENT '上传时间',
+    updated_by VARCHAR(64) NULL COMMENT '更改者',
+    updated_by_user_id INT NULL COMMENT '更改者用户ID',
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更改时间',
+    UNIQUE KEY uk_dsr_detail_date (order_detail_id, planned_arrival_date),
+    INDEX idx_dsr_date (planned_arrival_date),
+    INDEX idx_dsr_order (order_no),
+    INDEX idx_dsr_material (material_no),
+    INDEX idx_dsr_booker (booker_user_id),
+    INDEX idx_dsr_assignee (assignee_user_id),
+    INDEX idx_dsr_status (status)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='大连西门子客户发货预定';
+
+CREATE TABLE IF NOT EXISTS dalian_shipping_date_assignments (
+    planned_arrival_date DATE PRIMARY KEY COMMENT '预定到货日期',
+    assignee_user_id INT NULL COMMENT '对接人员用户ID',
+    assignee_name VARCHAR(64) NOT NULL DEFAULT '' COMMENT '对接人员',
+    assigned_at DATETIME NULL COMMENT '指定时间',
+    assigned_by_user_id INT NULL COMMENT '指定人用户ID',
+    assigned_by_name VARCHAR(64) NOT NULL DEFAULT '' COMMENT '指定人',
+    packing_generated_by VARCHAR(64) NULL COMMENT '箱单最后生成者',
+    packing_generated_by_user_id INT NULL COMMENT '箱单最后生成者用户ID',
+    packing_generated_at DATETIME NULL COMMENT '箱单最后生成时间',
+    packing_content_stale TINYINT NOT NULL DEFAULT 0 COMMENT '生成后预定内容已变，须重新生成才能开始装箱',
+    created_by VARCHAR(64) NULL COMMENT '上传者',
+    created_by_user_id INT NULL COMMENT '上传者用户ID',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP COMMENT '上传时间',
+    updated_by VARCHAR(64) NULL COMMENT '更改者',
+    updated_by_user_id INT NULL COMMENT '更改者用户ID',
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP COMMENT '更改时间'
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='大连发货预定按日对接人（删光预定后仍保留）';
+
+CREATE TABLE IF NOT EXISTS dalian_shipping_progress_unreads (
+    planned_arrival_date DATE NOT NULL,
+    user_id INT NOT NULL,
+    unread TINYINT NOT NULL DEFAULT 1,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+    PRIMARY KEY (planned_arrival_date, user_id),
+    INDEX idx_dsr_unread_user (user_id, unread)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='大连发货进度未读（预定者/对接人）';
+
+CREATE TABLE IF NOT EXISTS dalian_shipping_reservation_logs (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    row_id BIGINT NULL COMMENT '预定行ID，删除后可空',
+    order_detail_id INT NULL,
+    order_no VARCHAR(64) NULL,
+    material_no VARCHAR(128) NULL,
+    planned_arrival_date DATE NULL,
+    action VARCHAR(32) NOT NULL COMMENT 'create/update/delete/assign/reassign/generate/regenerate/export/start_packing',
+    operator_user_id INT NULL,
+    operator_name VARCHAR(64) NOT NULL DEFAULT '',
+    operated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    change_summary TEXT NULL COMMENT '变更内容 JSON',
+    INDEX idx_dsr_log_row (row_id),
+    INDEX idx_dsr_log_order (order_no),
+    INDEX idx_dsr_log_material (material_no),
+    INDEX idx_dsr_log_date (planned_arrival_date),
+    INDEX idx_dsr_log_action (action),
+    INDEX idx_dsr_log_time (operated_at)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='大连发货预定操作日志';

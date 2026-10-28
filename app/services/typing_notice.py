@@ -1,13 +1,16 @@
-"""实验建档变动后的打字要求工作台通知：操作人 + 合同负责人。"""
+"""实验建档变动后同步打字要求，并通知该明细的上传者与更新者。"""
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any
 
 from fastapi import HTTPException, status
 
 from app.api.deps import CurrentUser
 from app.core.database import execute, fetch_all, fetch_one
+
+logger = logging.getLogger(__name__)
 
 STATUS_PENDING = "待确认"
 STATUS_CONFIRMED = "已确认"
@@ -131,107 +134,41 @@ def ensure_typing_notice_table() -> None:
     _TABLES_READY = True
 
 
-def _po_variants(order_no: str) -> tuple[str, str, str]:
-    raw = _norm(order_no)
-    digits = raw
-    upper = raw.upper()
-    if upper.startswith("PO"):
-        digits = raw[2:].strip()
-    return raw or digits, digits, f"PO{digits}" if digits else raw
-
-
-def _collect_owners(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    seen: set[int] = set()
-    owners: list[dict[str, Any]] = []
-    for row in rows:
-        owner_id = int(row.get("owner_user_id") or 0)
-        if owner_id <= 0 or owner_id in seen:
-            continue
-        seen.add(owner_id)
-        owners.append(
-            {
-                "contract_archive_id": int(row.get("contract_archive_id") or 0) or None,
-                "contract_file_name": _norm(row.get("contract_file_name")),
-                "owner_user_id": owner_id,
-                "owner_name": _norm(row.get("owner_name")),
-            }
-        )
-    return owners
-
-
-def _france_contract_owners(order_no: str) -> list[dict[str, Any]]:
-    if not (
-        _table_exists("france_customer_packing_list_items")
-        and _table_exists("france_customer_packing_lists")
-        and _table_exists("customer_contract_archives")
-    ):
-        return []
-    raw, digits, po_prefixed = _po_variants(order_no)
-    rows = fetch_all(
-        """
-        SELECT DISTINCT
-            a.id AS contract_archive_id,
-            a.file_name AS contract_file_name,
-            a.owner_user_id,
-            a.owner_name
-        FROM france_customer_packing_list_items i
-        INNER JOIN france_customer_packing_lists l ON l.id = i.list_id
-        INNER JOIN customer_contract_archives a ON a.id = l.contract_archive_id
-        WHERE TRIM(i.po) IN (%s, %s, %s)
-          AND a.owner_user_id IS NOT NULL
-          AND a.owner_user_id <> 0
-        ORDER BY a.id
-        """,
-        (raw, digits, po_prefixed),
-    )
-    return _collect_owners(rows)
-
-
-def _dalian_contract_owners(order_no: str) -> list[dict[str, Any]]:
-    if not (
-        _table_exists("dalian_econtract_order_contracts")
-        and _table_exists("customer_contract_archives")
-    ):
-        return []
-    raw, digits, po_prefixed = _po_variants(order_no)
-    rows = fetch_all(
-        """
-        SELECT DISTINCT
-            a.id AS contract_archive_id,
-            a.file_name AS contract_file_name,
-            a.owner_user_id,
-            a.owner_name
-        FROM dalian_econtract_order_contracts oc
-        INNER JOIN customer_contract_archives a ON a.id = oc.contract_archive_id
-        WHERE TRIM(oc.order_no) IN (%s, %s, %s)
-          AND a.owner_user_id IS NOT NULL
-          AND a.owner_user_id <> 0
-        ORDER BY a.id
-        """,
-        (raw, digits, po_prefixed),
-    )
-    return _collect_owners(rows)
-
-
-def _contract_owners_for_order(order_no: str) -> list[dict[str, Any]]:
-    merged: dict[int, dict[str, Any]] = {}
-    for owner in _france_contract_owners(order_no) + _dalian_contract_owners(order_no):
-        merged[int(owner["owner_user_id"])] = owner
-    return list(merged.values())
-
-
-def _recipients_for_order(order_no: str, user: CurrentUser) -> list[dict[str, Any]]:
-    by_id: dict[int, dict[str, Any]] = {
-        int(owner["owner_user_id"]): owner for owner in _contract_owners_for_order(order_no)
+def _empty_sync_result(**overrides: Any) -> dict[str, Any]:
+    result = {
+        "inserted_count": 0,
+        "updated_count": 0,
+        "detail_count": 0,
+        "order_detail_ids": [],
+        "notices": [],
+        "error": None,
     }
-    operator_id = int(user.id)
-    if operator_id not in by_id:
-        by_id[operator_id] = {
-            "contract_archive_id": None,
-            "contract_file_name": "",
-            "owner_user_id": operator_id,
-            "owner_name": _norm(user.name),
-        }
+    result.update(overrides)
+    return result
+
+
+def _recipient(user_id: int, name: str) -> dict[str, Any]:
+    return {
+        "contract_archive_id": None,
+        "contract_file_name": "",
+        "owner_user_id": user_id,
+        "owner_name": _norm(name),
+    }
+
+
+def _recipients_for_details(details: list[dict[str, Any]], user: CurrentUser) -> list[dict[str, Any]]:
+    by_id: dict[int, dict[str, Any]] = {}
+    for row in details:
+        pairs = (
+            (_as_int(row.get("created_by_user_id")), _norm(row.get("created_by"))),
+            (_as_int(row.get("updated_by_user_id")), _norm(row.get("updated_by"))),
+        )
+        for user_id, name in pairs:
+            if not user_id or user_id <= 0 or user_id in by_id:
+                continue
+            by_id[user_id] = _recipient(user_id, name)
+    if not by_id:
+        by_id[int(user.id)] = _recipient(int(user.id), user.name)
     return list(by_id.values())
 
 
@@ -288,7 +225,8 @@ def _load_details_by_ids(ids: list[int]) -> dict[int, dict[str, Any]]:
     placeholders = ", ".join(["%s"] * len(ids))
     rows = fetch_all(
         f"""
-        SELECT id, order_no, item_no, drawing_no, material_no, quantity, heat_no, heat_treatment_batch_no
+        SELECT id, order_no, item_no, drawing_no, material_no, quantity, heat_no, heat_treatment_batch_no,
+               created_by, created_by_user_id, updated_by, updated_by_user_id
         FROM order_details
         WHERE id IN ({placeholders})
         """,
@@ -393,22 +331,17 @@ def _mark_confirmed(notice_id: int, user_id: int | None) -> None:
     )
 
 
-def maybe_notify_experiment_typing_change(
-    updated_rows: list[dict[str, Any]],
-    before_map: dict[int, dict[str, Any]],
+def _notify_detail_owners(
+    unaligned: list[dict[str, Any]],
     user: CurrentUser,
 ) -> list[dict[str, Any]]:
-    """建档成功后的副作用：数量/炉号/热处理批号有填入或变动且未对齐则通知。失败不抛给调用方。"""
     ensure_typing_notice_table()
-    changed = [row for row in updated_rows if _watch_changed(before_map.get(int(row["id"])), row)]
-    if not changed:
-        return []
-    unaligned = _filter_unaligned_details(changed)
-    if not unaligned:
-        return []
+    ids = [int(row["id"]) for row in unaligned if row.get("id")]
+    fresh = _load_details_by_ids(ids)
+    details = [{**row, **(fresh.get(int(row["id"])) or {}), "id": int(row["id"])} for row in unaligned]
 
     by_order: dict[str, list[dict[str, Any]]] = {}
-    for row in unaligned:
+    for row in details:
         order_no = _norm(row.get("order_no"))
         if not order_no:
             continue
@@ -416,7 +349,8 @@ def maybe_notify_experiment_typing_change(
 
     results: list[dict[str, Any]] = []
     for order_no, snapshots in by_order.items():
-        recipients = _recipients_for_order(order_no, user)
+        order_details = [row for row in details if _norm(row.get("order_no")) == order_no]
+        recipients = _recipients_for_details(order_details, user)
         for recipient in recipients:
             pending = _find_pending(order_no, int(recipient["owner_user_id"]))
             if pending:
@@ -464,6 +398,79 @@ def maybe_notify_experiment_typing_change(
                 }
             )
     return results
+
+
+def _generate_for_details(details: list[dict[str, Any]], user: CurrentUser) -> dict[str, Any]:
+    from app.api.v1.typing_requirements import GenerateRequest, generate_typing_requirements
+
+    by_order: dict[str, list[int]] = {}
+    for row in details:
+        order_no = _norm(row.get("order_no"))
+        detail_id = int(row.get("id") or 0)
+        if not order_no or detail_id <= 0:
+            continue
+        by_order.setdefault(order_no, []).append(detail_id)
+
+    inserted = 0
+    updated = 0
+    for order_no, ids in by_order.items():
+        unique_ids = sorted(set(ids))
+        generated = generate_typing_requirements(
+            GenerateRequest(order_no=order_no, order_detail_ids=unique_ids, force_overwrite=False),
+            user,
+        )
+        inserted += int(generated.get("inserted_count") or 0)
+        updated += int(generated.get("updated_count") or 0)
+    return {"inserted_count": inserted, "updated_count": updated}
+
+
+def _sync_typing_after_experiment_change(
+    updated_rows: list[dict[str, Any]],
+    before_map: dict[int, dict[str, Any]],
+    user: CurrentUser,
+) -> dict[str, Any]:
+    ensure_typing_notice_table()
+    changed = [row for row in updated_rows if row.get("id") and _watch_changed(before_map.get(int(row["id"])), row)]
+    if not changed:
+        return _empty_sync_result()
+    unaligned = _filter_unaligned_details(changed)
+    if not unaligned:
+        return _empty_sync_result()
+
+    generated = _generate_for_details(unaligned, user)
+    notices = _notify_detail_owners(unaligned, user)
+    order_detail_ids = sorted({int(row["id"]) for row in unaligned})
+    return _empty_sync_result(
+        inserted_count=int(generated.get("inserted_count") or 0),
+        updated_count=int(generated.get("updated_count") or 0),
+        detail_count=len(unaligned),
+        order_detail_ids=order_detail_ids,
+        notices=notices,
+    )
+
+
+def sync_typing_after_experiment_change(
+    updated_rows: list[dict[str, Any]],
+    before_map: dict[int, dict[str, Any]],
+    user: CurrentUser,
+) -> dict[str, Any]:
+    """保存成功后的副作用：三字段变化且未对齐则生成打字要求并通知上传者/更新者。失败不抛。"""
+    try:
+        return _sync_typing_after_experiment_change(updated_rows, before_map, user)
+    except Exception as exc:
+        logger.exception("sync typing after experiment change failed")
+        detail = getattr(exc, "detail", None)
+        if not isinstance(detail, str) or not detail.strip():
+            detail = str(exc) or "打字要求同步失败"
+        return _empty_sync_result(error=detail)
+
+
+def maybe_notify_experiment_typing_change(
+    updated_rows: list[dict[str, Any]],
+    before_map: dict[int, dict[str, Any]],
+    user: CurrentUser,
+) -> dict[str, Any]:
+    return sync_typing_after_experiment_change(updated_rows, before_map, user)
 
 
 def sync_pending_notices_for_order(order_no: str, *, confirm_notice_id: int | None = None, user_id: int | None = None) -> None:
@@ -545,12 +552,39 @@ def confirm_typing_notice(notice_id: int, user: CurrentUser) -> dict[str, Any]:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="仅通知接收人可以处理该提醒")
     if _norm(row.get("status")) != STATUS_PENDING:
         raise HTTPException(status_code=400, detail="该通知已确认")
-    _mark_confirmed(notice_id, user.id)
+
+    snapshots = _parse_changed_rows(row.get("changed_rows"))
+    order_no = _norm(row.get("order_no"))
+    order_detail_ids = sorted(
+        {int(item.get("order_detail_id") or 0) for item in snapshots if int(item.get("order_detail_id") or 0) > 0}
+    )
+    generated = None
+    still = _filter_still_unaligned(snapshots)
+    if still:
+        details = []
+        loaded = _load_details_by_ids([int(item.get("order_detail_id") or 0) for item in still])
+        for item in still:
+            detail = loaded.get(int(item.get("order_detail_id") or 0))
+            if detail:
+                details.append(detail)
+        if details:
+            try:
+                generated = _generate_for_details(details, user)
+            except Exception:
+                logger.exception("backfill typing generate on notice confirm failed")
+                generated = {"error": "补生成打字要求失败"}
+
+    sync_pending_notices_for_order(order_no, confirm_notice_id=notice_id, user_id=user.id)
     updated = fetch_one(
         f"SELECT {SELECT_SQL} FROM workbench_typing_notices WHERE id=%s",
         (notice_id,),
     )
-    return {"item": _row_to_item(updated or row)}
+    return {
+        "item": _row_to_item(updated or row),
+        "order_no": order_no,
+        "order_detail_ids": order_detail_ids,
+        "generated": generated,
+    }
 
 
 def generate_from_typing_notice(notice_id: int, order_detail_ids: list[int], user: CurrentUser) -> dict[str, Any]:
