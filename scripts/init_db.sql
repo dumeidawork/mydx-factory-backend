@@ -506,3 +506,21 @@ CREATE TABLE IF NOT EXISTS customer_contract_archive_logs (
     INDEX idx_archive_log_action (action),
     INDEX idx_archive_log_time (operated_at)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='客户原始合同归档操作日志';
+
+CREATE TABLE IF NOT EXISTS workbench_typing_notices (
+    id INT PRIMARY KEY AUTO_INCREMENT,
+    order_no VARCHAR(64) NOT NULL COMMENT '订单号',
+    contract_archive_id INT NULL COMMENT '关联合同 id',
+    contract_file_name VARCHAR(255) NOT NULL DEFAULT '' COMMENT '合同文件名快照',
+    owner_user_id INT NOT NULL COMMENT '通知接收人',
+    owner_name VARCHAR(64) NULL,
+    trigger_user_id INT NULL COMMENT '触发建档的操作人',
+    trigger_user_name VARCHAR(64) NULL,
+    changed_rows TEXT NULL COMMENT '未对齐明细 JSON',
+    status VARCHAR(16) NOT NULL DEFAULT '待确认' COMMENT '待确认/已确认',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    confirmed_at DATETIME NULL,
+    confirmed_by_user_id INT NULL,
+    INDEX idx_typing_notice_owner_status (owner_user_id, status),
+    INDEX idx_typing_notice_order (order_no)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='实验建档变动打字要求工作台通知';

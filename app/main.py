@@ -21,7 +21,7 @@ from app.core.config import get_settings
 from app.core.database import ping_database
 from app.core.file_log import append_log_line
 from app.core.paths import get_storage_dir
-from app.api.v1 import auth, contract_archives, customer_packing, documents, drawing_archives, finance, heat_treatment, license, operations, price_split, resource_fetch, warehouse, workbench, workflow
+from app.api.v1 import auth, contract_archives, customer_packing, dalian_econtract, documents, drawing_archives, dn_inch_maps, finance, heat_treatment, license, material_typing_maps, operations, paint_requirements, price_split, qr_label_designs, resource_fetch, typing_requirements, warehouse, workbench, workflow
 
 settings = get_settings()
 LOG_DIR = get_storage_dir() / "logs"
@@ -122,11 +122,17 @@ app.include_router(finance.router, prefix="/api/v1")
 app.include_router(auth.router, prefix="/api/v1")
 app.include_router(contract_archives.router, prefix="/api/v1")
 app.include_router(customer_packing.router, prefix="/api/v1")
+app.include_router(dalian_econtract.router, prefix="/api/v1")
 app.include_router(drawing_archives.router, prefix="/api/v1")
 app.include_router(documents.router, prefix="/api/v1")
 app.include_router(operations.router, prefix="/api/v1")
 app.include_router(workflow.router, prefix="/api/v1")
 app.include_router(price_split.router, prefix="/api/v1")
+app.include_router(paint_requirements.router, prefix="/api/v1")
+app.include_router(dn_inch_maps.router, prefix="/api/v1")
+app.include_router(material_typing_maps.router, prefix="/api/v1")
+app.include_router(typing_requirements.router, prefix="/api/v1")
+app.include_router(qr_label_designs.router, prefix="/api/v1")
 app.include_router(heat_treatment.router, prefix="/api/v1")
 app.include_router(license.router, prefix="/api/v1")
 app.include_router(resource_fetch.router, prefix="/api/v1")

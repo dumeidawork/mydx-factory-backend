@@ -11,6 +11,7 @@ from app.api.deps import get_accept_language
 from app.core.database import execute, execute_many, fetch_all, fetch_one
 from app.core.i18n import get_message
 from app.services.in_memory_store import now_iso
+from app.utils.drawing_no import normalize_drawing_input
 
 router = APIRouter(prefix="/finance", tags=["财务"])
 
@@ -438,7 +439,7 @@ def save_test_fee_records(req: SaveTestFeeRequest):
         params.append((
             _normalize_fee_text(r.test_date),
             _normalize_fee_text(r.material_no),
-            _normalize_fee_text(r.drawing_no),
+            normalize_drawing_input(_normalize_fee_text(r.drawing_no)),
             r.specification,
             r.material,
             parse_quantity(r.quantity),

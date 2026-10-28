@@ -21,6 +21,9 @@ class Settings(BaseSettings):
     # 业务数据根目录（代码外持久盘；合同原件等）。为空则回退到仓库旁 data/。
     # 现网建议：C:\mingyuan-erp\data
     erp_data_dir: str = ""
+    # 运行时目录（日志、质保书生成物、导出）。为空则默认 {erp_data_dir}/storage
+    # 相对路径相对项目根，例如 data\storage
+    erp_storage_dir: str = ""
 
     # PDF 转换：docx → pdf（word=MS Word COM | libreoffice | auto）
     pdf_converter: str = "word"

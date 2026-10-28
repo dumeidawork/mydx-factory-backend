@@ -65,8 +65,15 @@ def main() -> None:
     ]
     from app.services.order_detail_audit import CREATE_LOG_TABLE_SQL as ORDER_DETAIL_LOG_TABLE_SQL
     from app.services.price_split_schema import CREATE_LOG_TABLE_SQL, CREATE_TABLE_SQL
-    from app.api.v1.customer_packing import CREATE_ITEM_SQL, CREATE_LIST_SQL, CREATE_LOG_SQL as FRANCE_PACKING_LOG_SQL
+    from app.api.v1.customer_packing import CREATE_ITEM_SQL, CREATE_LIST_SQL, CREATE_LOG_SQL as FRANCE_PACKING_LOG_SQL, CREATE_ORDER_CONTRACT_SQL as FRANCE_ORDER_CONTRACT_SQL
+    from app.api.v1.dalian_econtract import CREATE_ITEM_SQL as DALIAN_ECONTRACT_ITEM_SQL, CREATE_LIST_SQL as DALIAN_ECONTRACT_LIST_SQL, CREATE_LOG_SQL as DALIAN_ECONTRACT_LOG_SQL, CREATE_ORDER_CONTRACT_SQL as DALIAN_ORDER_CONTRACT_SQL
+    from app.api.v1.paint_requirements import CREATE_LOG_TABLE_SQL as PAINT_LOG_TABLE_SQL, CREATE_TABLE_SQL as PAINT_TABLE_SQL
+    from app.api.v1.dn_inch_maps import CREATE_LOG_TABLE_SQL as DN_INCH_LOG_TABLE_SQL, CREATE_TABLE_SQL as DN_INCH_TABLE_SQL
+    from app.api.v1.material_typing_maps import CREATE_LOG_TABLE_SQL as MATERIAL_TYPING_LOG_TABLE_SQL, CREATE_TABLE_SQL as MATERIAL_TYPING_TABLE_SQL
+    from app.api.v1.typing_requirements import CREATE_LOG_TABLE_SQL as TYPING_LOG_TABLE_SQL, CREATE_TABLE_SQL as TYPING_TABLE_SQL
+    from app.api.v1.qr_label_designs import CREATE_LOG_TABLE_SQL as QR_LABEL_LOG_TABLE_SQL, CREATE_TABLE_SQL as QR_LABEL_TABLE_SQL
     from app.services.license_schema import CREATE_LICENSE_CERTIFICATE_ITEMS_SQL, CREATE_LICENSE_DOCS_SQL
+    from app.services.typing_notice import CREATE_TABLE_SQL as TYPING_NOTICE_TABLE_SQL
 
     create_statements.extend(
         [
@@ -77,8 +84,24 @@ def main() -> None:
             CREATE_LIST_SQL,
             CREATE_ITEM_SQL,
             FRANCE_PACKING_LOG_SQL,
+            FRANCE_ORDER_CONTRACT_SQL,
+            DALIAN_ECONTRACT_LIST_SQL,
+            DALIAN_ECONTRACT_ITEM_SQL,
+            DALIAN_ECONTRACT_LOG_SQL,
+            DALIAN_ORDER_CONTRACT_SQL,
             CREATE_LICENSE_DOCS_SQL,
             CREATE_LICENSE_CERTIFICATE_ITEMS_SQL,
+            PAINT_TABLE_SQL,
+            PAINT_LOG_TABLE_SQL,
+            DN_INCH_TABLE_SQL,
+            DN_INCH_LOG_TABLE_SQL,
+            MATERIAL_TYPING_TABLE_SQL,
+            MATERIAL_TYPING_LOG_TABLE_SQL,
+            TYPING_TABLE_SQL,
+            TYPING_LOG_TABLE_SQL,
+            TYPING_NOTICE_TABLE_SQL,
+            QR_LABEL_TABLE_SQL,
+            QR_LABEL_LOG_TABLE_SQL,
         ]
     )
     alter_statements = [
@@ -140,8 +163,18 @@ def main() -> None:
         ("france_customer_packing_lists", "amount_checked_at", "ALTER TABLE france_customer_packing_lists ADD COLUMN amount_checked_at DATETIME NULL COMMENT '核对总单价确认时间' AFTER amount_checked"),
         ("france_customer_packing_lists", "packing_tax_sum", "ALTER TABLE france_customer_packing_lists ADD COLUMN packing_tax_sum DECIMAL(14,2) NULL COMMENT '核对当时的箱单含税合计' AFTER amount_checked_at"),
         ("france_customer_packing_lists", "contract_total_amount", "ALTER TABLE france_customer_packing_lists ADD COLUMN contract_total_amount DECIMAL(14,2) NULL COMMENT '核对当时的合同总金额' AFTER packing_tax_sum"),
+        ("france_customer_packing_lists", "factory_order_no", "ALTER TABLE france_customer_packing_lists ADD COLUMN factory_order_no VARCHAR(128) NOT NULL DEFAULT '' COMMENT '本厂单号' AFTER contract_total_amount"),
+        ("france_customer_packing_lists", "customer", "ALTER TABLE france_customer_packing_lists ADD COLUMN customer VARCHAR(128) NOT NULL DEFAULT '' COMMENT '客户' AFTER factory_order_no"),
         ("france_customer_packing_list_items", "tax_unit_price", "ALTER TABLE france_customer_packing_list_items ADD COLUMN tax_unit_price DECIMAL(12,2) NOT NULL DEFAULT 0.00 COMMENT '含税单价（保留2位）' AFTER agreement_price"),
         ("france_customer_packing_list_items", "tax_total_amount", "ALTER TABLE france_customer_packing_list_items ADD COLUMN tax_total_amount DECIMAL(14,2) NOT NULL DEFAULT 0.00 COMMENT '含税总价（含税单价×数量）' AFTER tax_unit_price"),
+        ("typing_requirements", "part_name", "ALTER TABLE typing_requirements ADD COLUMN part_name VARCHAR(128) NULL COMMENT '料号：法国默认-，大连取订单明细名称/料号' AFTER material_no"),
+        ("typing_requirements", "unit_weight", "ALTER TABLE typing_requirements ADD COLUMN unit_weight DECIMAL(12,2) NULL COMMENT '单重，取自订单明细' AFTER quantity"),
+        ("typing_requirements", "spec", "ALTER TABLE typing_requirements ADD COLUMN spec VARCHAR(255) NULL COMMENT '规格（展示：spec_display 或 spec）' AFTER typing_content"),
+        ("typing_requirements", "model_standard", "ALTER TABLE typing_requirements ADD COLUMN model_standard VARCHAR(255) NULL COMMENT '型号（标准）' AFTER spec"),
+        ("typing_requirements", "qr_spec", "ALTER TABLE typing_requirements ADD COLUMN qr_spec VARCHAR(128) NULL COMMENT '二维码规格信息' AFTER model_standard"),
+        ("workbench_typing_notices", "changed_rows", "ALTER TABLE workbench_typing_notices ADD COLUMN changed_rows TEXT NULL COMMENT '未对齐明细 JSON' AFTER owner_name"),
+        ("workbench_typing_notices", "trigger_user_id", "ALTER TABLE workbench_typing_notices ADD COLUMN trigger_user_id INT NULL COMMENT '触发建档的操作人' AFTER owner_name"),
+        ("workbench_typing_notices", "trigger_user_name", "ALTER TABLE workbench_typing_notices ADD COLUMN trigger_user_name VARCHAR(64) NULL AFTER trigger_user_id"),
     ]
 
     with get_db() as conn:
@@ -315,8 +348,32 @@ def main() -> None:
             ("table", "france_customer_packing_lists"),
             ("table", "france_customer_packing_list_items"),
             ("table", "france_customer_packing_operation_logs"),
+            ("table", "france_customer_packing_order_contracts"),
+            ("table", "dalian_econtract_lists"),
+            ("table", "dalian_econtract_items"),
+            ("table", "dalian_econtract_operation_logs"),
+            ("table", "dalian_econtract_order_contracts"),
             ("table", "license_docs"),
             ("table", "license_certificate_items"),
+            ("table", "paint_requirements"),
+            ("table", "paint_requirement_logs"),
+            ("table", "dn_inch_maps"),
+            ("table", "dn_inch_map_logs"),
+            ("table", "material_typing_maps"),
+            ("table", "material_typing_map_logs"),
+            ("table", "typing_requirements"),
+            ("table", "typing_requirement_logs"),
+            ("table", "qr_label_designs"),
+            ("table", "qr_label_design_logs"),
+            ("table", "workbench_typing_notices"),
+            ("column", "workbench_typing_notices.changed_rows"),
+            ("column", "workbench_typing_notices.trigger_user_id"),
+            ("column", "workbench_typing_notices.trigger_user_name"),
+            ("column", "typing_requirements.part_name"),
+            ("column", "typing_requirements.unit_weight"),
+            ("column", "typing_requirements.spec"),
+            ("column", "typing_requirements.model_standard"),
+            ("column", "typing_requirements.qr_spec"),
             ("column", "order_details.created_by"),
             ("column", "order_details.created_by_user_id"),
             ("column", "order_details.updated_by"),
@@ -348,6 +405,8 @@ def main() -> None:
             ("column", "materials.france_agreement_price"),
             ("column", "materials.dalian_agreement_price"),
             ("column", "dalian_shipping_details.factory_order_no"),
+            ("column", "france_customer_packing_lists.factory_order_no"),
+            ("column", "france_customer_packing_lists.customer"),
             ("column", "qc_records.order_detail_id"),
             ("column", "qc_records.item_no"),
             ("column", "qc_records.item_no_key"),

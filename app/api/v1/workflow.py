@@ -78,6 +78,7 @@ from app.services.qc_certificate_snapshot import (
     upsert_snapshot_from_record,
 )
 from app.api.deps import CurrentUser, get_current_user
+from app.utils.drawing_no import drawing_no_in_sql, drawing_no_match_variants, normalize_drawing_input
 from app.services.order_detail_audit import (
     AUDIT_COLUMN_ALTERS,
     AUDIT_CREATE_COLUMNS,
@@ -151,6 +152,10 @@ def _normalize_str(v: Any) -> str:
     if v is None:
         return ""
     return str(v).strip()
+
+
+def _norm_drawing(v: Any) -> str:
+    return normalize_drawing_input(_normalize_str(v))
 
 
 def _append_log_line(file_name: str, line: str) -> None:
@@ -589,13 +594,14 @@ def _qc_base_material_type(material: str) -> str:
 
 def _lookup_material_ut_mt_pt(material_no: str, drawing_no: str) -> dict[str, str]:
     _ensure_materials_table()
+    drawing_sql, drawing_params = drawing_no_in_sql("COALESCE(drawing_no, '')", drawing_no)
     row = fetch_one(
-        """
+        f"""
         SELECT ut, mt, pt FROM materials
-        WHERE material_no=%s AND COALESCE(drawing_no, '')=%s
+        WHERE material_no=%s AND {drawing_sql}
         LIMIT 1
         """,
-        (_normalize_str(material_no), _normalize_str(drawing_no)),
+        (_normalize_str(material_no), *drawing_params),
     )
     if not row:
         return {"ut": "", "mt": "", "pt": ""}
@@ -1007,6 +1013,8 @@ def _serialize_order_detail_patch(patch: dict) -> dict[str, Any]:
             normalized[key] = _safe_float(value)
         elif key == "status":
             normalized["order_status"] = _normalize_str(value)
+        elif key == "drawing_no":
+            normalized["drawing_no"] = _norm_drawing(value)
         else:
             normalized[key] = _normalize_str(value) if isinstance(value, str) else value
     return normalized
@@ -1108,13 +1116,14 @@ def _material_archive_exists(material_no: str, drawing_no: str = "") -> bool:
         _ensure_materials_table()
     except Exception:
         pass
+    drawing_sql, drawing_params = drawing_no_in_sql("COALESCE(drawing_no, '')", drawing_no)
     row = fetch_one(
-        """
+        f"""
         SELECT id FROM materials
-        WHERE material_no=%s AND COALESCE(drawing_no, '')=%s
+        WHERE material_no=%s AND {drawing_sql}
         LIMIT 1
         """,
-        (m_no, _normalize_str(drawing_no)),
+        (m_no, *drawing_params),
     )
     return bool(row)
 
@@ -1135,12 +1144,13 @@ def _refresh_doc_status_for_order_rows(*, drawing_no: str | None = None, materia
     _ensure_order_details_doc_status_column()
     _ensure_order_details_loaded()
     d_filter = _normalize_str(drawing_no) if drawing_no is not None else None
+    d_variants = set(drawing_no_match_variants(d_filter)) if d_filter else set()
     m_filter = _normalize_str(material_no) if material_no is not None else None
     changed = 0
     for r in order_details:
         d_no = _normalize_str(r.get("drawing_no", ""))
         m_no = _normalize_str(r.get("material_no", ""))
-        if d_filter is not None and d_no != d_filter:
+        if d_filter is not None and d_no != d_filter and d_no not in d_variants:
             continue
         if m_filter is not None and m_no != m_filter:
             continue
@@ -1375,7 +1385,7 @@ def _material_row_from_db(row: dict) -> dict:
 
 
 def _material_drawing_key(material_no: str, drawing_no: str, standard_no: str = "") -> tuple[str, str, str]:
-    return (_normalize_str(material_no), _normalize_str(drawing_no), _normalize_str(standard_no))
+    return (_normalize_str(material_no), _norm_drawing(drawing_no), _normalize_str(standard_no))
 
 
 def _find_material_duplicate(
@@ -1387,15 +1397,16 @@ def _find_material_duplicate(
     key_no, key_drawing, key_standard = _material_drawing_key(material_no, drawing_no, standard_no)
     if not key_no:
         return None
+    drawing_sql, drawing_params = drawing_no_in_sql("COALESCE(drawing_no, '')", key_drawing)
     row = fetch_one(
-        """
+        f"""
         SELECT id, material_no, drawing_no, standard_no FROM materials
         WHERE material_no = %s
-          AND COALESCE(drawing_no, '') = %s
+          AND {drawing_sql}
           AND COALESCE(standard_no, '') = %s
         LIMIT 1
         """,
-        (key_no, key_drawing, key_standard),
+        (key_no, *drawing_params, key_standard),
     )
     if not row:
         return None
@@ -1422,7 +1433,7 @@ def upsert_material_from_drawing(
     key_no = _normalize_str(material_no)
     if not key_no:
         raise HTTPException(status_code=400, detail="物料号不能为空")
-    key_drawing = _normalize_str(drawing_no)
+    key_drawing = _norm_drawing(drawing_no)
     key_standard = _normalize_str(standard_no)
     existing = _find_material_duplicate(key_no, key_drawing, key_standard)
     if existing:
@@ -1467,6 +1478,28 @@ def upsert_material_from_drawing(
     return "inserted"
 
 
+def delete_material_matching(
+    *,
+    material_no: str,
+    drawing_no: str,
+    standard_no: str = "",
+) -> dict:
+    """按物料号+图纸号+标准号删除物料；找不到则 deleted=False。"""
+    _ensure_materials_table()
+    existing = _find_material_duplicate(material_no, drawing_no, standard_no)
+    if not existing:
+        return {"deleted": False, "deleted_id": None, "marked_pending_docs_count": 0}
+    material_id = int(existing["id"])
+    key_no = _normalize_str(existing.get("material_no", ""))
+    key_drawing = _normalize_str(existing.get("drawing_no", ""))
+    execute("DELETE FROM materials WHERE id=%s", (material_id,))
+    _load_materials()
+    marked_pending = 0
+    if key_no:
+        marked_pending = _refresh_doc_status_for_order_rows(material_no=key_no, drawing_no=key_drawing or None)
+    return {"deleted": True, "deleted_id": material_id, "marked_pending_docs_count": marked_pending}
+
+
 def _load_materials(material_no: str = "", drawing_no: str = "") -> list[dict]:
     _ensure_materials_table()
     material_no_text = _normalize_str(material_no)
@@ -1477,8 +1510,9 @@ def _load_materials(material_no: str = "", drawing_no: str = "") -> list[dict]:
         conditions.append("material_no LIKE %s")
         params.append(f"%{material_no_text}%")
     if drawing_no_text:
-        conditions.append("drawing_no LIKE %s")
-        params.append(f"%{drawing_no_text}%")
+        variants = drawing_no_match_variants(drawing_no_text) or [drawing_no_text]
+        conditions.append("(" + " OR ".join(["drawing_no LIKE %s"] * len(variants)) + ")")
+        params.extend([f"%{item}%" for item in variants])
     where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
     rows = fetch_all(
         f"""
@@ -1801,7 +1835,7 @@ def _parse_excel_rows(file_path: Path) -> list[dict]:
         item = {
             "seq": _safe_int(seq),
             "name": _normalize_str(name),
-            "drawing_no": _normalize_str(ws[f"C{row_no}"].value),
+            "drawing_no": _norm_drawing(ws[f"C{row_no}"].value),
             "material_no": _normalize_str(material_no),
             "spec_model": _normalize_str(ws[f"E{row_no}"].value),
             "material": _normalize_str(ws[f"F{row_no}"].value),
@@ -2186,7 +2220,7 @@ def _normalize_dalian_row(row: DalianShippingDetailRow, delivery_date: str) -> d
     return {
         "delivery_date": resolved_delivery_date,
         "packing_no": _normalize_str(row.packing_no),
-        "drawing_no": _normalize_str(row.drawing_no),
+        "drawing_no": _norm_drawing(row.drawing_no),
         "ap1_material_no": _normalize_str(row.ap1_material_no),
         "r3p_material_no": _normalize_str(row.r3p_material_no),
         "spec_model": _normalize_str(row.spec_model),
@@ -2683,7 +2717,8 @@ def create_manual_order(req: ManualOrderSubmitRequest, user: UserDep):
     created = []
     pending_count = 0
     for row in req.rows:
-        doc_status = _compute_doc_status(row.drawing_no, row.material_no)
+        drawing_no = _norm_drawing(row.drawing_no)
+        doc_status = _compute_doc_status(drawing_no, row.material_no)
         if doc_status == DOC_STATUS_PENDING:
             pending_count += 1
         agreement_price = round(float(row.agreement_price or 0), 2)
@@ -2697,7 +2732,7 @@ def create_manual_order(req: ManualOrderSubmitRequest, user: UserDep):
             ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             """,
             (
-                req.order_no, req.customer, req.factory_order_no, row.seq, row.item_no, row.name, row.drawing_no, row.material_no, row.spec_model, "",
+                req.order_no, req.customer, req.factory_order_no, row.seq, row.item_no, row.name, drawing_no, row.material_no, row.spec_model, "",
                 "", row.material, row.quantity, round(float(row.unit_weight), 2), round(float(row.total_weight), 2),
                 agreement_price, product_unit_price, row.remark1, row.remark2,
                 "", "", "开始", doc_status, "手动录入", "", now, None, *create_audit_values(user),
@@ -2711,7 +2746,7 @@ def create_manual_order(req: ManualOrderSubmitRequest, user: UserDep):
             "seq": row.seq,
             "item_no": row.item_no,
             "name": row.name,
-            "drawing_no": row.drawing_no,
+            "drawing_no": drawing_no,
             "material_no": row.material_no,
             "spec_model": row.spec_model,
             "spec": "",
@@ -3220,7 +3255,7 @@ def batch_apply_production(req: ProductionBatchApplyRequest):
 
 
 @router.post("/production/confirm")
-def confirm_production(req: ProductionConfirmRequest):
+def confirm_production(req: ProductionConfirmRequest, user: UserDep):
     _ensure_order_details_loaded()
     order_no = _normalize_str(req.order_no)
     now = now_iso()
@@ -3232,6 +3267,17 @@ def confirm_production(req: ProductionConfirmRequest):
     }
     if not confirm_id_map:
         raise HTTPException(status_code=400, detail="没有可确认的数据")
+    before_ids = list(confirm_id_map.keys())
+    before_placeholders = ", ".join(["%s"] * len(before_ids))
+    before_rows = fetch_all(
+        f"""
+        SELECT id, quantity, heat_no, heat_treatment_batch_no
+        FROM order_details
+        WHERE id IN ({before_placeholders})
+        """,
+        tuple(before_ids),
+    )
+    before_map = {int(row["id"]): row for row in before_rows}
     for r in order_details:
         row = confirm_id_map.get(int(r["id"]))
         if row is None:
@@ -3267,7 +3313,36 @@ def confirm_production(req: ProductionConfirmRequest):
             for r in updated
         ],
     )
-    return {"status": "success", "updated_count": len(updated), "rows": updated}
+    typing_notices: list[dict] = []
+    try:
+        from app.services.typing_notice import maybe_notify_experiment_typing_change
+
+        typing_notices = maybe_notify_experiment_typing_change(updated, before_map, user)
+    except Exception:
+        typing_notices = []
+    notified_names = sorted(
+        {
+            str(item.get("owner_name") or "").strip()
+            for item in typing_notices
+            if item.get("created") or item.get("updated")
+        }
+    )
+    seen_orders: set[str] = set()
+    unaligned_count = 0
+    for item in typing_notices:
+        order_key = str(item.get("order_no") or "")
+        if not order_key or order_key in seen_orders:
+            continue
+        seen_orders.add(order_key)
+        unaligned_count += int(item.get("unaligned_count") or 0)
+    return {
+        "status": "success",
+        "updated_count": len(updated),
+        "rows": updated,
+        "typing_notices": typing_notices,
+        "notified_names": notified_names,
+        "unaligned_count": unaligned_count,
+    }
 
 
 @router.post("/production/inbound")
@@ -3330,20 +3405,21 @@ def lookup_materials(req: MaterialsLookupRequest):
     missing_rows: list[dict] = []
     for idx, raw in enumerate(req.rows):
         source_index = int(raw.get("source_index", idx))
-        drawing_no = _normalize_str(raw.get("drawing_no", ""))
+        drawing_no = _norm_drawing(raw.get("drawing_no", ""))
         material_no = _normalize_str(raw.get("material_no", ""))
         if not drawing_no or not material_no:
             missing_rows.append({"source_index": source_index, "drawing_no": drawing_no, "material_no": material_no, "reason": "图纸号或物料号为空"})
             continue
+        drawing_sql, drawing_params = drawing_no_in_sql("COALESCE(drawing_no, '')", drawing_no)
         row = fetch_one(
             f"""
             SELECT {_MATERIALS_SELECT_COLUMNS}
             FROM materials
-            WHERE material_no=%s AND COALESCE(drawing_no, '')=%s
+            WHERE material_no=%s AND {drawing_sql}
             ORDER BY id
             LIMIT 1
             """,
-            (material_no, drawing_no),
+            (material_no, *drawing_params),
         )
         if not row:
             missing_rows.append({"source_index": source_index, "drawing_no": drawing_no, "material_no": material_no, "reason": "未找到匹配物料"})
@@ -3367,7 +3443,7 @@ def submit_materials(req: MaterialsSaveRequest):
         material_no = _normalize_str(raw.get("material_no", ""))
         if not material_no:
             raise HTTPException(status_code=400, detail="物料号不能为空")
-        drawing_no = _normalize_str(raw.get("drawing_no", ""))
+        drawing_no = _norm_drawing(raw.get("drawing_no", ""))
         standard_no = _normalize_str(raw.get("standard_no", ""))
         unit_weight = _safe_float(raw.get("unit_weight"), 0.0)
         row_id = raw.get("id")

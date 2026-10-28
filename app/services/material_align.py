@@ -4,6 +4,7 @@ from __future__ import annotations
 from typing import Any
 
 from app.core.database import execute, fetch_all, fetch_one
+from app.utils.drawing_no import drawing_no_in_sql
 
 
 def _norm(value: Any) -> str:
@@ -86,16 +87,17 @@ def _find_material(material_no: str, drawing_candidates: list[str], standard_no:
         if not key_drawing or key_drawing in seen:
             continue
         seen.add(key_drawing)
+        drawing_sql, drawing_params = drawing_no_in_sql("COALESCE(drawing_no, '')", key_drawing)
         row = fetch_one(
-            """
+            f"""
             SELECT id, material_no, drawing_no, standard_no, spec, model, spec_model, material, unit_weight,
                    product_unit_price, france_agreement_price, dalian_agreement_price
             FROM materials
-            WHERE material_no=%s AND COALESCE(drawing_no, '')=%s
+            WHERE material_no=%s AND {drawing_sql}
             ORDER BY id
             LIMIT 1
             """,
-            (key_no, key_drawing),
+            (key_no, *drawing_params),
         )
         if row:
             return row
@@ -242,8 +244,10 @@ def get_pending_material_price_items(user_id: int) -> list[dict]:
 def _load_drawing_for_align(material_no: str, drawing_no: str) -> dict | None:
     if not _table_exists("drawing_archives"):
         return None
+    drawing_sql, drawing_params = drawing_no_in_sql("TRIM(drawing_no)", drawing_no)
+    rev_sql, rev_params = drawing_no_in_sql("TRIM(COALESCE(drawing_rev_no, ''))", drawing_no)
     return fetch_one(
-        """
+        f"""
         SELECT
             TRIM(material_no) AS material_no,
             TRIM(drawing_no) AS drawing_no,
@@ -253,13 +257,13 @@ def _load_drawing_for_align(material_no: str, drawing_no: str) -> dict | None:
         FROM drawing_archives
         WHERE TRIM(COALESCE(material_no, ''))=%s
           AND (
-            TRIM(drawing_no)=%s
-            OR TRIM(COALESCE(drawing_rev_no, ''))=%s
+            {drawing_sql}
+            OR {rev_sql}
           )
         ORDER BY updated_at DESC, id DESC
         LIMIT 1
         """,
-        (material_no, drawing_no, drawing_no),
+        (material_no, *drawing_params, *rev_params),
     )
 
 
@@ -270,26 +274,28 @@ def _load_price_row(region: str, material_no: str, drawing_no: str, part_no: str
     key_no = _norm(material_no)
     key_drawing = _norm(drawing_no)
     key_part = _norm(part_no)
+    drawing_sql, drawing_params = drawing_no_in_sql("TRIM(COALESCE(drawing_no, ''))", key_drawing)
+    code_sql, code_params = drawing_no_in_sql("TRIM(COALESCE(drawing_code, ''))", key_drawing)
     base_sql = f"""
         SELECT net_price, tax_inclusive_price, drawing_no, drawing_code
         FROM {table}
         WHERE is_valid=1
           AND TRIM(material_no)=%s
           AND (
-            TRIM(COALESCE(drawing_no, ''))=%s
-            OR TRIM(COALESCE(drawing_code, ''))=%s
+            {drawing_sql}
+            OR {code_sql}
           )
     """
     if region == "dalian" and key_part:
         row = fetch_one(
             base_sql + " AND TRIM(COALESCE(part_no, ''))=%s ORDER BY updated_at DESC, id DESC LIMIT 1",
-            (key_no, key_drawing, key_drawing, key_part),
+            (key_no, *drawing_params, *code_params, key_part),
         )
         if row:
             return row
     return fetch_one(
         base_sql + " ORDER BY updated_at DESC, id DESC LIMIT 1",
-        (key_no, key_drawing, key_drawing),
+        (key_no, *drawing_params, *code_params),
     )
 
 

@@ -16,6 +16,7 @@ from typing_extensions import Annotated
 from app.api.deps import CurrentUser, get_current_user
 from app.core.database import execute, fetch_all, fetch_one
 from app.core.paths import get_contract_archives_dir
+from app.utils.customer_region import is_dalian_contract_customer
 
 router = APIRouter(prefix="/contract-archives", tags=["客户原始合同归档"])
 
@@ -48,7 +49,7 @@ class AssignOwnerRequest(BaseModel):
 
 
 class ConfirmTakeoverRequest(BaseModel):
-    total_amount: Decimal
+    total_amount: Decimal | None = None
     confirm_real_amount: bool = False
 
 
@@ -331,6 +332,43 @@ def _is_chairman(user: CurrentUser) -> bool:
     return user.role_code == CHAIRMAN_ROLE_CODE
 
 
+def _can_delete_contract(row: dict, user: CurrentUser) -> bool:
+    if _is_chairman(user):
+        return True
+    uid = user.id
+    return uid in {
+        _normalize_owner_id(row.get("uploaded_by_user_id")),
+        _normalize_owner_id(row.get("updated_by_user_id")),
+    }
+
+
+def _table_exists(table_name: str) -> bool:
+    row = fetch_one(
+        """
+        SELECT 1 FROM information_schema.tables
+        WHERE table_schema = DATABASE() AND table_name = %s
+        LIMIT 1
+        """,
+        (table_name,),
+    )
+    return bool(row)
+
+
+def _contract_linked_to_packing(archive_id: int) -> bool:
+    checks = (
+        ("france_customer_packing_lists", "SELECT id FROM france_customer_packing_lists WHERE contract_archive_id=%s LIMIT 1"),
+        ("france_customer_packing_order_contracts", "SELECT id FROM france_customer_packing_order_contracts WHERE contract_archive_id=%s LIMIT 1"),
+        ("dalian_econtract_lists", "SELECT id FROM dalian_econtract_lists WHERE contract_archive_id=%s LIMIT 1"),
+        ("dalian_econtract_order_contracts", "SELECT id FROM dalian_econtract_order_contracts WHERE contract_archive_id=%s LIMIT 1"),
+    )
+    for table, sql in checks:
+        if _table_exists(table):
+            row = fetch_one(sql, (archive_id,))
+            if row:
+                return True
+    return False
+
+
 def _visibility_sql(user: CurrentUser) -> tuple[str, list[Any]]:
     """董事长可看全部；其他人仅看上传者/更新者/业务负责人为自己的合同。"""
     if _is_chairman(user):
@@ -486,7 +524,7 @@ async def create_archive(
     _ensure_unique(customer, original_name, ver, up_date)
     owner_id, owner_name = _resolve_owner(owner_user_id)
     _ensure_progress_columns()
-    amount = _normalize_amount(total_amount, required=True)
+    amount = _normalize_amount(total_amount, required=not is_dalian_contract_customer(customer))
     progress_status = PROGRESS_ASSIGNED if owner_id else PROGRESS_UPLOAD
 
     new_id = execute(
@@ -532,7 +570,7 @@ async def create_archive(
             "upload_date": _date_yyyymmdd(up_date),
             "storage_relative_path": rel_path,
             "owner_user_id": owner_id,
-            "total_amount": str(amount),
+            "total_amount": str(amount) if amount is not None else None,
         },
     )
     row = _get_archive_or_404(new_id)
@@ -731,13 +769,15 @@ def patch_archive(
             summary = new_summary
 
     total_amount = row.get("total_amount")
-    if body.total_amount is not None:
-        new_amount = _normalize_amount(body.total_amount, required=True)
+    if "total_amount" in body.model_fields_set:
+        new_amount = _normalize_amount(
+            body.total_amount, required=not is_dalian_contract_customer(customer)
+        )
         old_amount = _normalize_amount(total_amount, required=False)
         if old_amount != new_amount:
             changes["total_amount"] = {
                 "from": str(old_amount) if old_amount is not None else None,
-                "to": str(new_amount),
+                "to": str(new_amount) if new_amount is not None else None,
             }
             total_amount = new_amount
 
@@ -993,10 +1033,34 @@ def confirm_takeover(
         raise HTTPException(status_code=400, detail="当前合同不是待接手状态")
     if not _has_downloaded_after_assign(archive_id, user.id, row.get("assigned_at")):
         raise HTTPException(status_code=400, detail="请先下载该合同的原始文件后再确认接手")
-    entered = _normalize_amount(body.total_amount, required=True)
-    if entered is None:
-        raise HTTPException(status_code=400, detail="合同总金额不能为空")
+    is_dalian = is_dalian_contract_customer(row.get("customer_name"))
+    entered = _normalize_amount(body.total_amount, required=not is_dalian)
     stored = row.get("total_amount")
+
+    if entered is None:
+        execute(
+            """
+            UPDATE customer_contract_archives
+            SET progress_status=%s
+            WHERE id=%s
+            """,
+            (PROGRESS_CONFIRMED, archive_id),
+        )
+        _write_log(
+            archive_id,
+            "confirm_takeover",
+            user,
+            {
+                "from": PROGRESS_ASSIGNED,
+                "to": PROGRESS_CONFIRMED,
+                "file_name": row.get("file_name"),
+                "entered_amount": None,
+                "stored_amount": str(stored) if stored is not None else None,
+                "amount_skipped": True,
+            },
+        )
+        return {"item": _row_to_dict(_get_archive_or_404(archive_id))}
+
     matched = _amounts_equal(stored, entered)
     if not matched and not body.confirm_real_amount:
         raise HTTPException(status_code=400, detail=AMOUNT_MISMATCH_DETAIL)
@@ -1069,6 +1133,48 @@ def confirm_amount_change(
         },
     )
     return {"item": _row_to_dict(_get_archive_or_404(archive_id))}
+
+
+@router.delete("/{archive_id}")
+def delete_archive(
+    archive_id: int,
+    user: Annotated[CurrentUser, Depends(get_current_user)],
+):
+    _ensure_progress_columns()
+    row = _get_archive_or_404(archive_id)
+    if not _can_delete_contract(row, user):
+        if _archive_visible_to(row, user):
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="仅该条上传者、更新者或董事长可以删除")
+        raise HTTPException(status_code=404, detail="合同归档不存在")
+    if _contract_linked_to_packing(archive_id):
+        raise HTTPException(status_code=400, detail="该合同已关联客户箱单/电子合同，请先处理后再删除")
+
+    rel = str(row.get("storage_relative_path") or "")
+    file_deleted = False
+    file_missing = False
+    if rel:
+        path = _absolute_from_relative(rel)
+        if path.is_file():
+            path.unlink()
+            file_deleted = True
+        else:
+            file_missing = True
+
+    execute("DELETE FROM customer_contract_archives WHERE id=%s", (archive_id,))
+    _write_log(
+        archive_id,
+        "delete",
+        user,
+        {
+            "customer_name": row.get("customer_name"),
+            "file_name": row.get("file_name"),
+            "version": row.get("version"),
+            "path": rel,
+            "file_deleted": file_deleted,
+            "file_missing_before_delete": file_missing,
+        },
+    )
+    return {"ok": True, "file_missing_before_delete": file_missing}
 
 
 @router.get("/{archive_id}/download")

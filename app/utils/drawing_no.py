@@ -49,3 +49,36 @@ def looks_like_drawing_rev(raw: str) -> bool:
     if _REV_SPLIT.search(text):
         return True
     return bool(re.search(r"-\d+[A-Za-z0-9]*$", text))
+
+
+def should_normalize_drawing_input(raw: str) -> bool:
+    """仅对「图纸号-版本号」转 Rev 形，避免规格类 FDK-115-518 被改写。"""
+    text = (raw or "").strip()
+    if not text:
+        return False
+    if _REV_SPLIT.search(text):
+        return True
+    if not re.search(r"-\d+[A-Za-z0-9]*$", text):
+        return False
+    if text.count("-") == 1:
+        return True
+    return bool(re.match(r"^A5E", text, re.I))
+
+
+def normalize_drawing_input(raw: str) -> str:
+    """录入图纸号：像图纸号-版本号才转 Rev 形，否则只 trim。"""
+    text = (raw or "").strip()
+    if not text:
+        return ""
+    if should_normalize_drawing_input(text):
+        return normalize_drawing_rev_for_db(text)
+    return text
+
+
+def drawing_no_in_sql(column: str, raw: str) -> tuple[str, tuple[str, ...]]:
+    """等值查询：兼容原文 / Rev 形 / 连字符形。"""
+    variants = drawing_no_match_variants(raw)
+    if not variants:
+        return f"{column}=%s", ("",)
+    placeholders = ", ".join(["%s"] * len(variants))
+    return f"{column} IN ({placeholders})", tuple(variants)

@@ -12,6 +12,7 @@ from pydantic import BaseModel, Field
 from typing_extensions import Annotated
 
 from app.api.deps import CurrentUser, get_current_user
+from app.utils.drawing_no import drawing_no_match_variants, normalize_drawing_input
 from app.core.database import execute, fetch_all, fetch_one
 from app.services.france_sea_packing_parser import calc_total_weight, dn_key, drawing_rev_number, parse_sea_workbook
 from app.services.in_memory_store import now_iso
@@ -42,6 +43,8 @@ CREATE TABLE IF NOT EXISTS france_customer_packing_lists (
     amount_checked_at DATETIME NULL COMMENT '核对总单价确认时间',
     packing_tax_sum DECIMAL(14,2) NULL COMMENT '核对当时的箱单含税合计',
     contract_total_amount DECIMAL(14,2) NULL COMMENT '核对当时的合同总金额',
+    factory_order_no VARCHAR(128) NOT NULL DEFAULT '' COMMENT '本厂单号',
+    customer VARCHAR(128) NOT NULL DEFAULT '' COMMENT '客户',
     created_by VARCHAR(64) NULL COMMENT '上传者',
     created_by_user_id INT NULL COMMENT '上传者用户ID',
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP COMMENT '上传时间',
@@ -110,6 +113,21 @@ CREATE TABLE IF NOT EXISTS france_customer_packing_operation_logs (
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='法国客户附带箱单操作日志'
 """
 
+CREATE_ORDER_CONTRACT_SQL = """
+CREATE TABLE IF NOT EXISTS france_customer_packing_order_contracts (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    list_id BIGINT NOT NULL COMMENT '箱单主表 id',
+    order_no VARCHAR(64) NOT NULL COMMENT 'PO / 订单号',
+    contract_archive_id INT NOT NULL COMMENT '关联客户合同 id',
+    contract_file_name VARCHAR(255) NOT NULL DEFAULT '' COMMENT '合同文件名快照',
+    contract_version VARCHAR(32) NOT NULL DEFAULT '' COMMENT '合同版本号快照',
+    contract_total_amount DECIMAL(14,2) NULL COMMENT '关联时的合同总金额',
+    UNIQUE KEY uk_fcpl_oc_list_order (list_id, order_no),
+    INDEX idx_fcpl_oc_list (list_id),
+    INDEX idx_fcpl_oc_contract (contract_archive_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='法国箱单：订单号与合同一对一'
+"""
+
 ITEM_COLUMNS = (
     "seq, material_no, dn, units_per_pallet, quantity, nb_of_pallets, unit_weight, total_weight, "
     "po, pos, drawing_no, spec_model, spec, model, material, product_unit_price, agreement_price, "
@@ -133,6 +151,14 @@ LIST_COLUMN_ALTERS = (
     (
         "contract_total_amount",
         "ALTER TABLE france_customer_packing_lists ADD COLUMN contract_total_amount DECIMAL(14,2) NULL COMMENT '核对当时的合同总金额' AFTER packing_tax_sum",
+    ),
+    (
+        "factory_order_no",
+        "ALTER TABLE france_customer_packing_lists ADD COLUMN factory_order_no VARCHAR(128) NOT NULL DEFAULT '' COMMENT '本厂单号' AFTER contract_total_amount",
+    ),
+    (
+        "customer",
+        "ALTER TABLE france_customer_packing_lists ADD COLUMN customer VARCHAR(128) NOT NULL DEFAULT '' COMMENT '客户' AFTER factory_order_no",
     ),
 )
 
@@ -176,14 +202,22 @@ class PackingItemIn(BaseModel):
     match_warning: str = ""
 
 
-class SavePackingRequest(BaseModel):
+class OrderContractIn(BaseModel):
+    order_no: str
     contract_archive_id: int
+
+
+class SavePackingRequest(BaseModel):
+    contract_archive_id: int = 0
     departure_date: str = ""
     arrival_date: str = ""
     source_file_name: str = ""
+    factory_order_no: str = ""
+    customer: str = ""
     amount_checked: bool = False
     packing_tax_sum: float | None = None
     contract_total_amount: float | None = None
+    order_contracts: list[OrderContractIn] = Field(default_factory=list)
     items: list[PackingItemIn]
 
 
@@ -225,11 +259,13 @@ def _column_exists(table: str, column: str) -> bool:
 
 def _ensure_tables() -> None:
     global _TABLES_READY
+    execute(CREATE_ORDER_CONTRACT_SQL)
     if _TABLES_READY:
         return
     execute(CREATE_LIST_SQL)
     execute(CREATE_ITEM_SQL)
     execute(CREATE_LOG_SQL)
+    execute(CREATE_ORDER_CONTRACT_SQL)
     for name, stmt in LIST_COLUMN_ALTERS:
         if not _column_exists("france_customer_packing_lists", name):
             execute(stmt)
@@ -302,6 +338,139 @@ def _load_own_contract(archive_id: int, user: CurrentUser) -> dict:
     if owner_id != int(user.id):
         raise HTTPException(status_code=400, detail="只能关联业务负责人为当前登录者的合同")
     return row
+
+
+def _contract_hit(archive_id: int) -> dict[str, Any]:
+    archive = fetch_one(
+        """
+        SELECT id, total_amount, customer_name, file_name, version, owner_user_id, owner_name
+        FROM customer_contract_archives WHERE id=%s
+        """,
+        (int(archive_id),),
+    )
+    if not archive:
+        return {
+            "contract_archive_id": int(archive_id),
+            "id": int(archive_id),
+            "order_no": "",
+            "file_name": "",
+            "version": "",
+            "customer_name": "",
+            "owner_name": "",
+            "total_amount": None,
+            "contract_total_amount_live": None,
+            "can_link": False,
+        }
+    return {
+        "contract_archive_id": int(archive["id"]),
+        "id": int(archive["id"]),
+        "order_no": "",
+        "file_name": str(archive.get("file_name") or ""),
+        "version": str(archive.get("version") or ""),
+        "contract_file_name": str(archive.get("file_name") or ""),
+        "contract_version": str(archive.get("version") or ""),
+        "customer_name": archive.get("customer_name") or "",
+        "owner_name": archive.get("owner_name") or "",
+        "owner_user_id": archive.get("owner_user_id"),
+        "total_amount": _jsonable(archive.get("total_amount")),
+        "contract_total_amount_live": _jsonable(archive.get("total_amount")),
+        "can_link": True,
+    }
+
+
+def _load_order_contracts(list_id: int) -> list[dict]:
+    rows = fetch_all(
+        """
+        SELECT * FROM france_customer_packing_order_contracts
+        WHERE list_id=%s ORDER BY order_no, id
+        """,
+        (list_id,),
+    )
+    out: list[dict] = []
+    for row in rows:
+        hit = _contract_hit(int(row["contract_archive_id"]))
+        hit["order_no"] = str(row.get("order_no") or "").strip()
+        hit["contract_file_name"] = str(row.get("contract_file_name") or hit.get("file_name") or "")
+        hit["contract_version"] = str(row.get("contract_version") or hit.get("version") or "")
+        if hit.get("total_amount") is None and row.get("contract_total_amount") is not None:
+            hit["total_amount"] = _jsonable(row.get("contract_total_amount"))
+        out.append(hit)
+    return out
+
+
+def _legacy_order_contracts(header: dict, items: list[dict], order_key: str) -> list[dict]:
+    archive_id = header.get("contract_archive_id")
+    if not archive_id:
+        return []
+    order_nos = sorted(
+        {str(it.get(order_key) or "").strip() for it in items if str(it.get(order_key) or "").strip()}
+    )
+    if not order_nos:
+        return []
+    hit = _contract_hit(int(archive_id))
+    hit["contract_file_name"] = hit.get("file_name") or str(header.get("contract_file_name") or "")
+    hit["contract_version"] = hit.get("version") or str(header.get("contract_version") or "")
+    if hit.get("total_amount") is None and header.get("contract_total_amount") is not None:
+        hit["total_amount"] = _jsonable(header.get("contract_total_amount"))
+    return [{**hit, "order_no": order_no} for order_no in order_nos]
+
+
+def _resolve_order_contracts(header: dict, items: list[dict], order_key: str) -> list[dict]:
+    mapped = _load_order_contracts(int(header["id"]))
+    if mapped:
+        return mapped
+    return _legacy_order_contracts(header, items, order_key)
+
+
+def _replace_order_contracts(list_id: int, mappings: list[tuple[str, dict]]) -> None:
+    execute("DELETE FROM france_customer_packing_order_contracts WHERE list_id=%s", (list_id,))
+    for order_no, contract in mappings:
+        total = contract.get("total_amount")
+        execute(
+            """
+            INSERT INTO france_customer_packing_order_contracts
+                (list_id, order_no, contract_archive_id, contract_file_name, contract_version, contract_total_amount)
+            VALUES (%s, %s, %s, %s, %s, %s)
+            """,
+            (
+                list_id,
+                order_no,
+                int(contract["id"]),
+                str(contract.get("file_name") or ""),
+                str(contract.get("version") or ""),
+                None if total is None else _round2(total),
+            ),
+        )
+
+
+def _validate_order_contract_mappings(
+    order_nos: list[str],
+    req_mappings: list[OrderContractIn],
+    user: CurrentUser,
+) -> list[tuple[str, dict]]:
+    if not order_nos:
+        raise HTTPException(status_code=400, detail="没有有效订单号，无法关联合同")
+    by_order: dict[str, int] = {}
+    for item in req_mappings:
+        key = str(item.order_no or "").strip()
+        if key:
+            by_order[key] = int(item.contract_archive_id)
+    missing = [order_no for order_no in order_nos if order_no not in by_order]
+    if missing:
+        raise HTTPException(status_code=400, detail=f"以下订单号尚未关联合同：{'、'.join(missing)}")
+    used: dict[int, str] = {}
+    result: list[tuple[str, dict]] = []
+    for order_no in order_nos:
+        archive_id = by_order[order_no]
+        prior = used.get(archive_id)
+        if prior and prior != order_no:
+            raise HTTPException(
+                status_code=400,
+                detail=f"合同 #{archive_id} 已关联订单号 {prior}，每个订单号须对应不同合同文件",
+            )
+        used[archive_id] = order_no
+        result.append((order_no, _load_own_contract(archive_id, user)))
+    return result
 
 
 def _load_list(list_id: int) -> dict:
@@ -410,7 +579,8 @@ def enrich_material(material_no: str, dn: str = "", drawing_no: str = "") -> dic
         result["match_warning"] = "未找到物料"
         return result
 
-    wanted_drawing = (drawing_no or "").strip()
+    wanted_drawing = normalize_drawing_input(drawing_no)
+    wanted_variants = set(drawing_no_match_variants(wanted_drawing)) if wanted_drawing else set()
     dn_wanted = dn_key(dn)
 
     def _row_matches_dn(row: dict) -> bool:
@@ -424,7 +594,15 @@ def enrich_material(material_no: str, dn: str = "", drawing_no: str = "") -> dic
     dn_matched = [r for r in rows if _row_matches_dn(r)]
 
     if wanted_drawing:
-        picked = next((r for r in rows if str(r.get("drawing_no") or "") == wanted_drawing), None)
+        picked = next(
+            (
+                r
+                for r in rows
+                if str(r.get("drawing_no") or "") == wanted_drawing
+                or str(r.get("drawing_no") or "") in wanted_variants
+            ),
+            None,
+        )
         if not picked:
             result["match_warning"] = "未找到所选图纸号"
             result["drawing_candidates"] = [str(r.get("drawing_no") or "") for r in rows if r.get("drawing_no")]
@@ -508,7 +686,7 @@ def _item_values(item: PackingItemIn | dict, user: CurrentUser) -> tuple[Any, ..
         total_weight,
         str(data.get("po") or "").strip(),
         data.get("pos"),
-        str(data.get("drawing_no") or "").strip(),
+        normalize_drawing_input(data.get("drawing_no")),
         str(data.get("spec_model") or "").strip(),
         str(data.get("spec") or "").strip(),
         str(data.get("model") or "").strip(),
@@ -558,6 +736,7 @@ def _find_overwrite_ids(departure: date | None, po_list: list[str]) -> list[int]
 
 
 def _delete_list(list_id: int) -> None:
+    execute("DELETE FROM france_customer_packing_order_contracts WHERE list_id=%s", (list_id,))
     execute("DELETE FROM france_customer_packing_list_items WHERE list_id=%s", (list_id,))
     execute("DELETE FROM france_customer_packing_lists WHERE id=%s", (list_id,))
 
@@ -565,16 +744,17 @@ def _delete_list(list_id: int) -> None:
 def _list_payload(row: dict, items: list[dict] | None = None) -> dict:
     payload = _row_to_dict(row)
     payload["items"] = items if items is not None else _load_items(int(row["id"]))
-    archive_id = payload.get("contract_archive_id")
-    if archive_id:
-        archive = fetch_one(
-            "SELECT total_amount, customer_name, file_name, version, owner_user_id, owner_name FROM customer_contract_archives WHERE id=%s",
-            (int(archive_id),),
-        )
-        if archive:
-            payload["contract_total_amount_live"] = _jsonable(archive.get("total_amount"))
-            payload["customer_name"] = archive.get("customer_name")
-            payload["owner_name"] = archive.get("owner_name")
+    payload["order_contracts"] = _resolve_order_contracts(row, payload["items"], "po")
+    first = payload["order_contracts"][0] if payload["order_contracts"] else None
+    if first:
+        payload["customer_name"] = first.get("customer_name")
+        payload["owner_name"] = first.get("owner_name")
+        payload["contract_total_amount_live"] = first.get("contract_total_amount_live")
+    elif payload.get("contract_archive_id"):
+        hit = _contract_hit(int(payload["contract_archive_id"]))
+        payload["customer_name"] = hit.get("customer_name")
+        payload["owner_name"] = hit.get("owner_name")
+        payload["contract_total_amount_live"] = hit.get("contract_total_amount_live")
     return payload
 
 
@@ -672,13 +852,25 @@ def save_france_packing(req: SavePackingRequest, user: UserDep):
         raise HTTPException(status_code=400, detail="明细不能为空")
     if not req.amount_checked:
         raise HTTPException(status_code=400, detail="请先完成【核对总单价】后再保存整单")
-    contract = _load_own_contract(req.contract_archive_id, user)
+    factory_order_no = str(req.factory_order_no or "").strip()
+    customer = str(req.customer or "").strip()
+    if not factory_order_no:
+        raise HTTPException(status_code=400, detail="本厂单号不能为空")
+    if not customer:
+        raise HTTPException(status_code=400, detail="客户不能为空")
+    if any(not str(item.po or "").strip() for item in req.items):
+        raise HTTPException(status_code=400, detail="存在未填订单号的明细，无法按订单号关联合同")
+    po_list = sorted({str(item.po or "").strip() for item in req.items if str(item.po or "").strip()})
+    mappings = list(req.order_contracts)
+    if not mappings and req.contract_archive_id:
+        mappings = [OrderContractIn(order_no=po, contract_archive_id=req.contract_archive_id) for po in po_list]
+    loaded_maps = _validate_order_contract_mappings(po_list, mappings, user)
+    contract = loaded_maps[0][1]
     packing_tax_sum = _sum_tax_total(req.items)
-    contract_total = None if contract.get("total_amount") is None else _round2(contract.get("total_amount"))
+    contract_total = _round2(sum(_round2(c.get("total_amount") or 0) for _, c in loaded_maps))
     checked_at = datetime.now()
     departure = _parse_date(req.departure_date)
     arrival = _parse_date(req.arrival_date)
-    po_list = sorted({str(item.po or "").strip() for item in req.items if str(item.po or "").strip()})
     overwrite_ids = _find_overwrite_ids(departure, po_list)
     keep_id = overwrite_ids[0] if overwrite_ids else None
     old_summaries = []
@@ -693,6 +885,7 @@ def save_france_packing(req: SavePackingRequest, user: UserDep):
             UPDATE france_customer_packing_lists SET
                 contract_archive_id=%s, contract_file_name=%s, contract_version=%s,
                 departure_date=%s, arrival_date=%s, source_file_name=%s,
+                factory_order_no=%s, customer=%s,
                 amount_checked=1, amount_checked_at=%s, packing_tax_sum=%s, contract_total_amount=%s,
                 updated_by=%s, updated_by_user_id=%s
             WHERE id=%s
@@ -704,6 +897,8 @@ def save_france_packing(req: SavePackingRequest, user: UserDep):
                 departure,
                 arrival,
                 req.source_file_name or "",
+                factory_order_no,
+                customer,
                 checked_at,
                 packing_tax_sum,
                 contract_total,
@@ -721,9 +916,10 @@ def save_france_packing(req: SavePackingRequest, user: UserDep):
             INSERT INTO france_customer_packing_lists (
                 contract_archive_id, contract_file_name, contract_version,
                 departure_date, arrival_date, source_file_name,
+                factory_order_no, customer,
                 amount_checked, amount_checked_at, packing_tax_sum, contract_total_amount,
                 created_by, created_by_user_id, updated_by, updated_by_user_id
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             """,
             (
                 int(contract["id"]),
@@ -732,6 +928,8 @@ def save_france_packing(req: SavePackingRequest, user: UserDep):
                 departure,
                 arrival,
                 req.source_file_name or "",
+                factory_order_no,
+                customer,
                 1,
                 checked_at,
                 packing_tax_sum,
@@ -748,6 +946,7 @@ def save_france_packing(req: SavePackingRequest, user: UserDep):
         if not item.seq:
             item.seq = idx
         _insert_item(list_id, item, user)
+    _replace_order_contracts(list_id, loaded_maps)
 
     _write_log(
         user,
@@ -755,6 +954,7 @@ def save_france_packing(req: SavePackingRequest, user: UserDep):
         list_id=list_id,
         change_summary={
             "contract_archive_id": int(contract["id"]),
+            "order_contracts": [{"order_no": po, "contract_archive_id": int(c["id"])} for po, c in loaded_maps],
             "po_list": po_list,
             "count": len(req.items),
             "overwritten": old_summaries,
@@ -785,8 +985,16 @@ def list_france_packing(
         )
         params.append(f"%{po.strip()}%")
     if contract_file_name.strip():
-        clauses.append("l.contract_file_name LIKE %s")
-        params.append(f"%{contract_file_name.strip()}%")
+        clauses.append(
+            """
+            (l.contract_file_name LIKE %s OR EXISTS (
+                SELECT 1 FROM france_customer_packing_order_contracts oc
+                WHERE oc.list_id = l.id AND oc.contract_file_name LIKE %s
+            ))
+            """
+        )
+        like = f"%{contract_file_name.strip()}%"
+        params.extend([like, like])
     if departure_date.strip():
         parsed = _parse_date(departure_date)
         if parsed:
@@ -877,6 +1085,7 @@ def patch_france_item(item_id: int, req: ItemPatchRequest, user: UserDep):
         extra = enrich_material(str(merged.get("material_no") or ""), str(merged.get("dn") or ""), "")
         merged.update(extra)
     elif "drawing_no" in req.patch:
+        merged["drawing_no"] = normalize_drawing_input(merged.get("drawing_no"))
         extra = enrich_material(
             str(merged.get("material_no") or ""),
             str(merged.get("dn") or ""),
@@ -907,7 +1116,7 @@ def patch_france_item(item_id: int, req: ItemPatchRequest, user: UserDep):
             float(merged.get("total_weight") or 0),
             str(merged.get("po") or ""),
             merged.get("pos"),
-            str(merged.get("drawing_no") or ""),
+            normalize_drawing_input(merged.get("drawing_no")),
             str(merged.get("spec_model") or ""),
             str(merged.get("spec") or ""),
             str(merged.get("model") or ""),
@@ -975,18 +1184,14 @@ def generate_france_orders(list_id: int, req: GenerateOrdersRequest, user: UserD
         raise HTTPException(status_code=400, detail="箱单明细为空，无法生成订单")
     if int(header.get("amount_checked") or 0) != 1:
         raise HTTPException(status_code=400, detail="请先完成【核对总单价】后再生成订单明细")
-    contract = fetch_one(
-        "SELECT * FROM customer_contract_archives WHERE id=%s",
-        (int(header["contract_archive_id"]),),
-    )
-    if not contract:
-        raise HTTPException(status_code=400, detail="关联合同不存在")
-    owner_id = int(contract.get("owner_user_id") or 0)
-    if owner_id != int(user.id):
-        raise HTTPException(status_code=400, detail="只能由该合同业务负责人生成订单明细")
-    customer = str(contract.get("customer_name") or "").strip()
+    mapped = _resolve_order_contracts(header, items, "po")
+    by_order = {str(m.get("order_no") or "").strip(): m for m in mapped}
+    factory_order_no = str(header.get("factory_order_no") or "").strip()
+    customer = str(header.get("customer") or "").strip()
+    if not factory_order_no:
+        raise HTTPException(status_code=400, detail="本厂单号不能为空，请先保存整单")
     if not customer:
-        raise HTTPException(status_code=400, detail="关联合同缺少客户名")
+        raise HTTPException(status_code=400, detail="客户不能为空，请先保存整单")
 
     warnings = []
     for idx, item in enumerate(items, start=1):
@@ -1011,6 +1216,13 @@ def generate_france_orders(list_id: int, req: GenerateOrdersRequest, user: UserD
         grouped.setdefault(po, []).append(item)
     if not grouped:
         raise HTTPException(status_code=400, detail="没有有效的 PO，无法生成订单")
+    for po in grouped:
+        hit = by_order.get(po)
+        if not hit or not hit.get("contract_archive_id"):
+            raise HTTPException(status_code=400, detail=f"订单号 {po} 未关联合同")
+        owner_id = int(hit.get("owner_user_id") or 0)
+        if owner_id != int(user.id):
+            raise HTTPException(status_code=400, detail=f"订单号 {po} 的合同只能由该合同业务负责人生成订单明细")
 
     _ensure_order_details_loaded()
     existing_pos = {
@@ -1035,7 +1247,7 @@ def generate_france_orders(list_id: int, req: GenerateOrdersRequest, user: UserD
     pending_count = 0
     for po, po_items in grouped.items():
         for seq, item in enumerate(po_items, start=1):
-            drawing_no = str(item.get("drawing_no") or "")
+            drawing_no = normalize_drawing_input(item.get("drawing_no"))
             material_no = str(item.get("material_no") or "")
             doc_status = _compute_doc_status(drawing_no, material_no)
             if doc_status == DOC_STATUS_PENDING:
@@ -1057,7 +1269,7 @@ def generate_france_orders(list_id: int, req: GenerateOrdersRequest, user: UserD
                 (
                     po,
                     customer,
-                    "",
+                    factory_order_no,
                     seq,
                     item.get("pos"),
                     "",
@@ -1089,7 +1301,7 @@ def generate_france_orders(list_id: int, req: GenerateOrdersRequest, user: UserD
                 "id": record_id,
                 "order_no": po,
                 "customer": customer,
-                "factory_order_no": "",
+                "factory_order_no": factory_order_no,
                 "seq": seq,
                 "item_no": item.get("pos"),
                 "name": "",

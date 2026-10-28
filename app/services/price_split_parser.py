@@ -7,6 +7,7 @@ from typing import Any
 
 from app.services.price_split_calc import apply_derived, empty_row
 from app.services.price_split_schema import MATERIAL_GROUPS
+from app.utils.drawing_no import normalize_drawing_input
 
 try:
     from openpyxl import load_workbook
@@ -99,7 +100,7 @@ def _to_int(value: Any) -> int:
 
 
 def _split_drawing(raw: str) -> tuple[str, str, str]:
-    text = _to_str(raw)
+    text = normalize_drawing_input(_to_str(raw))
     if not text:
         return "", "", ""
     match = re.match(r"^(?P<code>.+?)\s+(?P<rev>Rev\.?\s*\S+)$", text, re.I)

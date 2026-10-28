@@ -17,6 +17,7 @@ from app.api.deps import CurrentUser, get_current_user
 from app.core.database import execute, fetch_all, fetch_one
 from app.core.paths import get_storage_dir
 from app.services.price_split_audit import diff_fields, snapshot_keys, write_op_log
+from app.utils.drawing_no import drawing_no_in_sql, drawing_no_match_variants, normalize_drawing_input
 from app.services.price_split_calc import apply_derived
 from app.services.price_split_parser import parse_price_split_workbook
 from app.services.price_split_schema import (
@@ -180,6 +181,15 @@ def _payload_from_raw(raw: dict, region: str, *, recalc: bool = True) -> dict[st
             item[key] = None if raw_val in (None, "") else _safe_float(raw_val, 0.0)
         else:
             item[key] = _safe_float(raw.get(key), 0.0)
+    item["drawing_no"] = normalize_drawing_input(item.get("drawing_no") or "")
+    if item["drawing_no"]:
+        from app.services.price_split_parser import _split_drawing
+        full, code, rev = _split_drawing(item["drawing_no"])
+        item["drawing_no"] = full
+        if not item.get("drawing_code"):
+            item["drawing_code"] = code
+        if not item.get("drawing_rev"):
+            item["drawing_rev"] = rev
     item["material_group"] = _normalize_group(item.get("material_group") or raw.get("material_group"))
     if item["material_group"] not in MATERIAL_GROUPS:
         item["material_group"] = "A105"
@@ -336,28 +346,30 @@ def _log_row_change(
 def _sync_materials(region: str, item: dict) -> dict[str, Any]:
     field = "france_agreement_price" if region == "france" else "dalian_agreement_price"
     material_no = _normalize_str(item.get("material_no"))
-    drawing_no = _normalize_str(item.get("drawing_no"))
+    drawing_no = normalize_drawing_input(item.get("drawing_no"))
     drawing_code = _normalize_str(item.get("drawing_code"))
     net_price = round(_safe_float(item.get("net_price")), 2)
     if not material_no:
         return {"ok": False, "reason": "物料号为空"}
 
+    drawing_sql, drawing_params = drawing_no_in_sql("COALESCE(drawing_no, '')", drawing_no)
     matched = fetch_one(
-        """
+        f"""
         SELECT id, drawing_no FROM materials
-        WHERE material_no=%s AND COALESCE(drawing_no, '')=%s
+        WHERE material_no=%s AND {drawing_sql}
         ORDER BY id LIMIT 1
         """,
-        (material_no, drawing_no),
+        (material_no, *drawing_params),
     )
     if not matched and drawing_code:
+        code_sql, code_params = drawing_no_in_sql("COALESCE(drawing_no, '')", drawing_code)
         matched = fetch_one(
-            """
+            f"""
             SELECT id, drawing_no FROM materials
-            WHERE material_no=%s AND COALESCE(drawing_no, '')=%s
+            WHERE material_no=%s AND {code_sql}
             ORDER BY id LIMIT 1
             """,
-            (material_no, drawing_code),
+            (material_no, *code_params),
         )
     if not matched:
         rows = fetch_all("SELECT id, drawing_no FROM materials WHERE material_no=%s ORDER BY id", (material_no,))
@@ -449,8 +461,9 @@ def list_price_split(
         clauses.append("material_group=%s")
         params.append(_normalize_group(group))
     if _normalize_str(drawing_no):
-        clauses.append("drawing_no LIKE %s")
-        params.append(f"%{_normalize_str(drawing_no)}%")
+        variants = drawing_no_match_variants(drawing_no) or [_normalize_str(drawing_no)]
+        clauses.append("(" + " OR ".join(["drawing_no LIKE %s"] * len(variants)) + ")")
+        params.extend([f"%{item}%" for item in variants])
     if _normalize_str(material_no):
         clauses.append("material_no LIKE %s")
         params.append(f"%{_normalize_str(material_no)}%")
@@ -482,8 +495,10 @@ def lookup_price_split(
         clauses.append("material_group=%s")
         params.append(_normalize_group(material_group))
     if _normalize_str(drawing_no):
-        clauses.append("(drawing_no=%s OR drawing_code=%s)")
-        params.extend([_normalize_str(drawing_no), _normalize_str(drawing_no)])
+        drawing_sql, drawing_params = drawing_no_in_sql("drawing_no", drawing_no)
+        code_sql, code_params = drawing_no_in_sql("drawing_code", drawing_no)
+        clauses.append(f"({drawing_sql} OR {code_sql})")
+        params.extend([*drawing_params, *code_params])
     if region == "dalian" and _normalize_str(part_no):
         clauses.append("COALESCE(part_no,'')=%s")
         params.append(_normalize_str(part_no))

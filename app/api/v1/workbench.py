@@ -2,12 +2,18 @@
 from __future__ import annotations
 
 from fastapi import APIRouter, Depends
+from pydantic import BaseModel, Field
 from typing_extensions import Annotated
 
 from app.api.deps import CurrentUser, get_current_user
 from app.api.v1.contract_archives import get_pending_amount_confirm_items, get_pending_takeover_items
 from app.api.v1.drawing_archives import get_pending_review_items, get_pending_revise_items
 from app.services.material_align import get_pending_material_drawing_items, get_pending_material_price_items
+from app.services.typing_notice import (
+    confirm_typing_notice,
+    generate_from_typing_notice,
+    get_pending_typing_notice_items,
+)
 
 router = APIRouter(prefix="/workbench", tags=["工作台"])
 
@@ -20,6 +26,7 @@ def list_pending(user: Annotated[CurrentUser, Depends(get_current_user)]):
     drawing_revise_items = get_pending_revise_items(user.id)
     material_drawing_items = get_pending_material_drawing_items(user.id)
     material_price_items = get_pending_material_price_items(user.id)
+    typing_notice_items = get_pending_typing_notice_items(user.id)
     return {
         "items": items,
         "amount_items": amount_items,
@@ -27,6 +34,7 @@ def list_pending(user: Annotated[CurrentUser, Depends(get_current_user)]):
         "drawing_revise_items": drawing_revise_items,
         "material_drawing_items": material_drawing_items,
         "material_price_items": material_price_items,
+        "typing_notice_items": typing_notice_items,
         "count": (
             len(items)
             + len(amount_items)
@@ -34,5 +42,27 @@ def list_pending(user: Annotated[CurrentUser, Depends(get_current_user)]):
             + len(drawing_revise_items)
             + len(material_drawing_items)
             + len(material_price_items)
+            + len(typing_notice_items)
         ),
     }
+
+
+class TypingNoticeGenerateRequest(BaseModel):
+    order_detail_ids: list[int] = Field(default_factory=list)
+
+
+@router.post("/typing-notices/{notice_id}/confirm")
+def confirm_typing_notice_item(
+    notice_id: int,
+    user: Annotated[CurrentUser, Depends(get_current_user)],
+):
+    return confirm_typing_notice(notice_id, user)
+
+
+@router.post("/typing-notices/{notice_id}/generate")
+def generate_typing_notice_item(
+    notice_id: int,
+    req: TypingNoticeGenerateRequest,
+    user: Annotated[CurrentUser, Depends(get_current_user)],
+):
+    return generate_from_typing_notice(notice_id, req.order_detail_ids, user)

@@ -13,6 +13,8 @@ CREATE TABLE IF NOT EXISTS france_customer_packing_lists (
     amount_checked_at DATETIME NULL COMMENT '核对总单价确认时间',
     packing_tax_sum DECIMAL(14,2) NULL COMMENT '核对当时的箱单含税合计',
     contract_total_amount DECIMAL(14,2) NULL COMMENT '核对当时的合同总金额',
+    factory_order_no VARCHAR(128) NOT NULL DEFAULT '' COMMENT '本厂单号',
+    customer VARCHAR(128) NOT NULL DEFAULT '' COMMENT '客户',
     created_by VARCHAR(64) NULL COMMENT '上传者',
     created_by_user_id INT NULL COMMENT '上传者用户ID',
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP COMMENT '上传时间',
@@ -75,3 +77,16 @@ CREATE TABLE IF NOT EXISTS france_customer_packing_operation_logs (
     INDEX idx_fcpl_log_action (action),
     INDEX idx_fcpl_log_time (operated_at)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='法国客户附带箱单操作日志';
+
+CREATE TABLE IF NOT EXISTS france_customer_packing_order_contracts (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    list_id BIGINT NOT NULL COMMENT '箱单主表 id',
+    order_no VARCHAR(64) NOT NULL COMMENT 'PO / 订单号',
+    contract_archive_id INT NOT NULL COMMENT '关联客户合同 id',
+    contract_file_name VARCHAR(255) NOT NULL DEFAULT '' COMMENT '合同文件名快照',
+    contract_version VARCHAR(32) NOT NULL DEFAULT '' COMMENT '合同版本号快照',
+    contract_total_amount DECIMAL(14,2) NULL COMMENT '关联时的合同总金额',
+    UNIQUE KEY uk_fcpl_oc_list_order (list_id, order_no),
+    INDEX idx_fcpl_oc_list (list_id),
+    INDEX idx_fcpl_oc_contract (contract_archive_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='法国箱单：订单号与合同一对一';

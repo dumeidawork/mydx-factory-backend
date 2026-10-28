@@ -84,25 +84,56 @@ def get_warehouse_dir() -> Path:
     return path
 
 
+def _configured_storage_dir() -> str:
+    from app.core.config import get_settings
+
+    return (get_settings().erp_storage_dir or os.getenv("ERP_STORAGE_DIR", "")).strip()
+
+
+def _resolve_configured_path(raw: str) -> Path:
+    path = Path(raw).expanduser()
+    if not path.is_absolute():
+        path = get_project_root() / path
+    return path.resolve()
+
+
+def _has_generated_files(path: Path) -> bool:
+    generated = path / "generated"
+    if not generated.is_dir():
+        return False
+    try:
+        next(generated.iterdir())
+    except StopIteration:
+        return False
+    return True
+
+
 @lru_cache(maxsize=1)
 def get_storage_dir() -> Path:
-    """运行时生成物/日志目录。若已配置 ERP_DATA_DIR，优先使用 data 下子目录以与代码解耦。"""
-    data_dir = get_data_dir()
-    preferred_under_data = data_dir / "runtime"
-    # 若 ERP_DATA_DIR 已显式配置，或 data/runtime 已存在，则使用数据盘
-    configured = (os.getenv("ERP_DATA_DIR", "") or "").strip()
-    if configured or preferred_under_data.is_dir():
-        preferred_under_data.mkdir(parents=True, exist_ok=True)
-        (preferred_under_data / "logs").mkdir(parents=True, exist_ok=True)
-        return preferred_under_data
+    """
+    运行时生成物/日志目录。
+    优先 ERP_STORAGE_DIR；未配置则默认 {data}/storage（即项目旁 data\\storage，
+    或 ERP_DATA_DIR\\storage）。
+    新默认目录尚不存在时，若旧目录（data/runtime 或 backend/storage）里已有
+    generated 文件，则沿用旧目录，避免发版后找不到历史质保书。
+    """
+    configured = _configured_storage_dir()
+    if configured:
+        path = _resolve_configured_path(configured)
+    else:
+        default = (get_data_dir() / "storage").resolve()
+        path = default
+        if not default.is_dir():
+            for candidate in (
+                (get_data_dir() / "runtime").resolve(),
+                _BACKEND_DIR / "storage",
+                get_project_root() / "storage",
+                _BACKEND_DIR.parent / "storage",
+            ):
+                if candidate.is_dir() and _has_generated_files(candidate):
+                    path = candidate
+                    break
 
-    for candidate in (
-        _BACKEND_DIR / "storage",
-        get_project_root() / "storage",
-        _BACKEND_DIR.parent / "storage",
-    ):
-        if candidate.is_dir():
-            return candidate
-    preferred = _BACKEND_DIR / "storage"
-    preferred.mkdir(parents=True, exist_ok=True)
-    return preferred
+    path.mkdir(parents=True, exist_ok=True)
+    (path / "logs").mkdir(parents=True, exist_ok=True)
+    return path

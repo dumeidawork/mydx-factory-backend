@@ -24,6 +24,9 @@ from app.utils.drawing_no import (
     looks_like_drawing_rev,
     normalize_drawing_rev_for_db,
 )
+from app.utils.drawing_source_fields import DIM_FIELDS, DIM_LABELS, NEW_DIM_FIELDS
+from app.utils.drawing_source_xlsx import DrawingSourceParseError, parse_drawing_source_xlsx
+from app.utils.spec_parser import extract_spec_model_fields, spec_model_for_storage
 
 router = APIRouter(prefix="/drawing-archives", tags=["图纸建档"])
 
@@ -35,24 +38,26 @@ STATUS_UPLOADED = "上传"
 STATUS_REVISING = "修改"
 STATUS_REVIEWED = "审核"
 VALID_STATUSES = {STATUS_UPLOADED, STATUS_REVISING, STATUS_REVIEWED}
+CHAIRMAN_ROLE_CODE = "super_admin"
 
-DIM_FIELDS = (
-    "od_d",
-    "id_c",
-    "thk_t",
-    "thk_f",
-    "mouth_m",
-    "center_k",
-    "seat_a",
-    "seat_h_f",
-    "r_val",
-    "hole_h",
-    "hole_n",
-    "side_b",
-    "side_b_depth",
-    "unit_weight",
-)
-REQUIRED_DIM_FIELDS = ("od_d", "id_c", "thk_t", "unit_weight")
+def _dim_col_sql() -> str:
+    return ", ".join(DIM_FIELDS)
+
+
+def _dim_placeholders() -> str:
+    return ", ".join(["%s"] * len(DIM_FIELDS))
+
+
+def _dim_assign_sql() -> str:
+    return ", ".join(f"{k}=%s" for k in DIM_FIELDS)
+
+
+def _dim_values(payload: dict[str, str]) -> tuple[str, ...]:
+    return tuple(payload[k] for k in DIM_FIELDS)
+
+
+def _dims_from_locals(ns: dict[str, Any]) -> dict[str, str]:
+    return {k: str(ns.get(k) or "") for k in DIM_FIELDS}
 
 
 class BatchDownloadRequest(BaseModel):
@@ -88,6 +93,27 @@ class DrawingReviseRequest(BaseModel):
     side_b: str | None = None
     side_b_depth: str | None = None
     unit_weight: str | None = None
+    mouth_n: str | None = None
+    id_small_d: str | None = None
+    id_large_e: str | None = None
+    r1_val: str | None = None
+    r2_val: str | None = None
+    e_val: str | None = None
+    s_neck: str | None = None
+    hole_h2: str | None = None
+    hole_n2: str | None = None
+    pcd2: str | None = None
+    thru_c: str | None = None
+    side_hole: str | None = None
+    side_hole_depth: str | None = None
+    side_a: str | None = None
+    side_a_depth: str | None = None
+    bottom_hole: str | None = None
+    weld_theta: str | None = None
+    v1_deg: str | None = None
+    v2_deg: str | None = None
+    g_val: str | None = None
+    f_depth: str | None = None
 
 
 def _ensure_tables() -> None:
@@ -155,6 +181,19 @@ def _ensure_tables() -> None:
         ("side_b", "ALTER TABLE drawing_archives ADD COLUMN side_b VARCHAR(64) NOT NULL DEFAULT '' COMMENT '侧孔B' AFTER hole_n"),
         ("side_b_depth", "ALTER TABLE drawing_archives ADD COLUMN side_b_depth VARCHAR(64) NOT NULL DEFAULT '' COMMENT '侧孔B深度' AFTER side_b"),
         ("unit_weight", "ALTER TABLE drawing_archives ADD COLUMN unit_weight VARCHAR(64) NOT NULL DEFAULT '' COMMENT '单重' AFTER side_b_depth"),
+        ("mouth_n", "ALTER TABLE drawing_archives ADD COLUMN mouth_n VARCHAR(64) NOT NULL DEFAULT '' COMMENT '下口' AFTER mouth_m"),
+        *[
+            (
+                name,
+                (
+                    f"ALTER TABLE drawing_archives ADD COLUMN {name} VARCHAR(64) NOT NULL DEFAULT '' "
+                    f"COMMENT '{DIM_LABELS.get(name, name)}' AFTER "
+                    f"{'unit_weight' if name == NEW_DIM_FIELDS[1] else NEW_DIM_FIELDS[NEW_DIM_FIELDS.index(name) - 1]}"
+                ),
+            )
+            for name in NEW_DIM_FIELDS
+            if name != "mouth_n"
+        ],
         ("status", "ALTER TABLE drawing_archives ADD COLUMN status VARCHAR(16) NOT NULL DEFAULT '审核' COMMENT '上传/修改/审核' AFTER unit_weight"),
         ("reviewer_user_id", "ALTER TABLE drawing_archives ADD COLUMN reviewer_user_id INT NULL COMMENT '审核负责人' AFTER status"),
         ("reviewer_name", "ALTER TABLE drawing_archives ADD COLUMN reviewer_name VARCHAR(64) NOT NULL DEFAULT '' COMMENT '审核负责人姓名' AFTER reviewer_user_id"),
@@ -300,20 +339,7 @@ AUDIT_FIELDS = (
     "model",
     "material_no",
     "drawing_type",
-    "od_d",
-    "id_c",
-    "thk_t",
-    "thk_f",
-    "mouth_m",
-    "center_k",
-    "seat_a",
-    "seat_h_f",
-    "r_val",
-    "hole_h",
-    "hole_n",
-    "side_b",
-    "side_b_depth",
-    "unit_weight",
+    *DIM_FIELDS,
     "drawing_name",
     "storage_relative_path",
     "status",
@@ -347,17 +373,17 @@ def _archive_field_diff(before: dict, after: dict) -> dict[str, dict[str, str]]:
 
 
 def _resolve_identity(standard_no: str, drawing_rev_no: str) -> tuple[str, str, str, str]:
-    """返回 (standard_no, drawing_rev_db, match_key, filename_second_seg)。"""
+    """返回 (standard_no, drawing_rev_db, match_key, filename_second_seg)。二者可同时有，文件名优先图纸号。"""
     standard = (standard_no or "").strip()
     rev_raw = (drawing_rev_no or "").strip()
-    if bool(standard) == bool(rev_raw):
-        raise HTTPException(status_code=400, detail="标准号与图纸号-版本号必须填写其中一个，且不能同时填写")
-    if standard:
-        return standard, "", standard, standard
-    rev_db = normalize_drawing_rev_for_db(rev_raw)
-    if not rev_db:
+    if not standard and not rev_raw:
+        raise HTTPException(status_code=400, detail="标准号与图纸号-版本号必须填写其中一个")
+    rev_db = normalize_drawing_rev_for_db(rev_raw) if rev_raw else ""
+    if rev_raw and not rev_db:
         raise HTTPException(status_code=400, detail="请输入图纸号-版本号")
-    return "", rev_db, rev_db, drawing_rev_for_filename(rev_db)
+    match_key = rev_db or standard
+    name_second = drawing_rev_for_filename(rev_db) if rev_db else standard
+    return standard, rev_db, match_key, name_second
 
 
 def _resolve_fourth_segment(material_no: str, spec: str, model: str) -> tuple[str, str]:
@@ -408,16 +434,26 @@ def _get_archive_or_404(archive_id: int) -> dict:
 
 
 def _require_dim_fields(values: dict[str, str]) -> None:
-    labels = {
-        "spec_model": "规格型号",
-        "od_d": "D外径",
-        "id_c": "C内径",
-        "thk_t": "T厚度",
-        "unit_weight": "单重",
+    if not (values.get("spec_model") or "").strip():
+        raise HTTPException(status_code=400, detail="请填写必填项：规格型号")
+
+
+def _actor_user_id(value: Any) -> int | None:
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        return None
+    return n if n > 0 else None
+
+
+def _can_delete_drawing(row: dict, user: CurrentUser) -> bool:
+    if user.role_code == CHAIRMAN_ROLE_CODE:
+        return True
+    uid = user.id
+    return uid in {
+        _actor_user_id(row.get("uploaded_by_user_id")),
+        _actor_user_id(row.get("updated_by_user_id")),
     }
-    missing = [labels[k] for k in ("spec_model", *REQUIRED_DIM_FIELDS) if not (values.get(k) or "").strip()]
-    if missing:
-        raise HTTPException(status_code=400, detail=f"请填写必填项：{'、'.join(missing)}")
 
 
 def _parse_unit_weight(raw: str) -> float:
@@ -640,17 +676,20 @@ def _collect_payload(
     drawing_type: str,
     dims: dict[str, str],
 ) -> dict[str, str]:
+    parsed = extract_spec_model_fields(spec_model)
     customer = customer_code.strip()
     mat = material.strip()
-    dtype = drawing_type.strip()
-    spec_model_val = spec_model.strip()
-    spec_val = spec.strip()
-    model_val = model.strip()
+    spec_val = spec.strip() or parsed["spec"]
+    model_val = model.strip() or parsed["model"]
+    dtype = drawing_type.strip() or parsed["drawing_type"]
+    mat_in = material_no.strip() or parsed["material_no"]
+    standard_in = standard_no.strip() or parsed["standard_no"]
+    spec_model_val = spec_model_for_storage(spec_model, mat_in)
     if not customer or not mat or not dtype:
         raise HTTPException(status_code=400, detail="客户代码、材质、类型均为必填")
     _require_dim_fields({"spec_model": spec_model_val, **dims})
-    standard, rev_db, match_key, name_second = _resolve_identity(standard_no, drawing_rev_no)
-    mat_no, fourth = _resolve_fourth_segment(material_no, spec_val, model_val)
+    standard, rev_db, match_key, name_second = _resolve_identity(standard_in, drawing_rev_no)
+    mat_no, fourth = _resolve_fourth_segment(mat_in, spec_val, model_val)
     return {
         "customer_code": customer,
         "standard_no": standard,
@@ -698,40 +737,46 @@ async def upload_drawing(
     material_no: str = Form(""),
     standard_no: str = Form(""),
     drawing_rev_no: str = Form(""),
-    od_d: str = Form(...),
-    id_c: str = Form(...),
-    thk_t: str = Form(...),
+    od_d: str = Form(""),
+    id_c: str = Form(""),
+    thk_t: str = Form(""),
     thk_f: str = Form(""),
     mouth_m: str = Form(""),
+    mouth_n: str = Form(""),
     center_k: str = Form(""),
     seat_a: str = Form(""),
     seat_h_f: str = Form(""),
+    id_small_d: str = Form(""),
+    id_large_e: str = Form(""),
     r_val: str = Form(""),
+    r1_val: str = Form(""),
+    r2_val: str = Form(""),
+    e_val: str = Form(""),
+    s_neck: str = Form(""),
     hole_h: str = Form(""),
     hole_n: str = Form(""),
+    hole_h2: str = Form(""),
+    hole_n2: str = Form(""),
+    pcd2: str = Form(""),
+    thru_c: str = Form(""),
+    side_hole: str = Form(""),
+    side_hole_depth: str = Form(""),
+    side_a: str = Form(""),
+    side_a_depth: str = Form(""),
     side_b: str = Form(""),
     side_b_depth: str = Form(""),
-    unit_weight: str = Form(...),
+    bottom_hole: str = Form(""),
+    weld_theta: str = Form(""),
+    v1_deg: str = Form(""),
+    v2_deg: str = Form(""),
+    g_val: str = Form(""),
+    f_depth: str = Form(""),
+    unit_weight: str = Form(""),
     reviewer_user_id: int = Form(...),
     file: UploadFile = File(...),
 ):
     _ensure_tables()
-    dims = {
-        "od_d": od_d,
-        "id_c": id_c,
-        "thk_t": thk_t,
-        "thk_f": thk_f,
-        "mouth_m": mouth_m,
-        "center_k": center_k,
-        "seat_a": seat_a,
-        "seat_h_f": seat_h_f,
-        "r_val": r_val,
-        "hole_h": hole_h,
-        "hole_n": hole_n,
-        "side_b": side_b,
-        "side_b_depth": side_b_depth,
-        "unit_weight": unit_weight,
-    }
+    dims = _dims_from_locals(locals())
     payload = _collect_payload(
         customer_code=customer_code,
         standard_no=standard_no,
@@ -760,19 +805,18 @@ async def upload_drawing(
 
     try:
         new_id = execute(
-            """
+            f"""
             INSERT INTO drawing_archives (
                 customer_code, drawing_no, standard_no, drawing_rev_no, material,
                 spec_model, spec, model, material_no, drawing_type,
-                od_d, id_c, thk_t, thk_f, mouth_m, center_k, seat_a, seat_h_f,
-                r_val, hole_h, hole_n, side_b, side_b_depth, unit_weight,
+                {_dim_col_sql()},
                 drawing_name, storage_relative_path, file_size, content_type,
                 uploaded_at, uploaded_by_user_id, uploaded_by_name,
                 updated_by_user_id, updated_by_name,
                 status, reviewer_user_id, reviewer_name, review_remark, reviewed_at
             ) VALUES (
                 %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
-                %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
+                {_dim_placeholders()},
                 %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s
             )
             """,
@@ -787,20 +831,7 @@ async def upload_drawing(
                 payload["model"],
                 payload["material_no"],
                 payload["drawing_type"],
-                payload["od_d"],
-                payload["id_c"],
-                payload["thk_t"],
-                payload["thk_f"],
-                payload["mouth_m"],
-                payload["center_k"],
-                payload["seat_a"],
-                payload["seat_h_f"],
-                payload["r_val"],
-                payload["hole_h"],
-                payload["hole_n"],
-                payload["side_b"],
-                payload["side_b_depth"],
-                payload["unit_weight"],
+                *_dim_values(payload),
                 drawing_name,
                 rel_path,
                 len(raw),
@@ -974,6 +1005,24 @@ def get_by_order(
     }
 
 
+@router.post("/parse-source-xlsx")
+async def parse_source_xlsx(
+    user: Annotated[CurrentUser, Depends(get_current_user)],
+    file: UploadFile = File(...),
+    sheet_name: str = Form(""),
+):
+    filename = (file.filename or "").lower()
+    if not filename.endswith(".xlsx"):
+        raise HTTPException(status_code=400, detail="仅支持 .xlsx 尺寸表")
+    raw = await file.read()
+    if not raw:
+        raise HTTPException(status_code=400, detail="文件不能为空")
+    try:
+        return parse_drawing_source_xlsx(raw, sheet_name=sheet_name or None)
+    except DrawingSourceParseError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @router.post("/batch-download")
 def batch_download(
     body: BatchDownloadRequest,
@@ -1056,12 +1105,11 @@ def _apply_revise_fields(row: dict, body: DrawingReviseRequest) -> dict[str, str
 
 def _update_archive_fields(archive_id: int, payload: dict[str, str], operator: CurrentUser) -> None:
     execute(
-        """
+        f"""
         UPDATE drawing_archives
         SET customer_code=%s, drawing_no=%s, standard_no=%s, drawing_rev_no=%s, material=%s,
             spec_model=%s, spec=%s, model=%s, material_no=%s, drawing_type=%s,
-            od_d=%s, id_c=%s, thk_t=%s, thk_f=%s, mouth_m=%s, center_k=%s, seat_a=%s, seat_h_f=%s,
-            r_val=%s, hole_h=%s, hole_n=%s, side_b=%s, side_b_depth=%s, unit_weight=%s,
+            {_dim_assign_sql()},
             updated_by_user_id=%s, updated_by_name=%s, updated_at=NOW()
         WHERE id=%s
         """,
@@ -1076,20 +1124,7 @@ def _update_archive_fields(archive_id: int, payload: dict[str, str], operator: C
             payload["model"],
             payload["material_no"],
             payload["drawing_type"],
-            payload["od_d"],
-            payload["id_c"],
-            payload["thk_t"],
-            payload["thk_f"],
-            payload["mouth_m"],
-            payload["center_k"],
-            payload["seat_a"],
-            payload["seat_h_f"],
-            payload["r_val"],
-            payload["hole_h"],
-            payload["hole_n"],
-            payload["side_b"],
-            payload["side_b_depth"],
-            payload["unit_weight"],
+            *_dim_values(payload),
             operator.id,
             operator.name,
             archive_id,
@@ -1214,20 +1249,41 @@ async def update_drawing(
     material_no: str = Form(""),
     standard_no: str = Form(""),
     drawing_rev_no: str = Form(""),
-    od_d: str = Form(...),
-    id_c: str = Form(...),
-    thk_t: str = Form(...),
+    od_d: str = Form(""),
+    id_c: str = Form(""),
+    thk_t: str = Form(""),
     thk_f: str = Form(""),
     mouth_m: str = Form(""),
+    mouth_n: str = Form(""),
     center_k: str = Form(""),
     seat_a: str = Form(""),
     seat_h_f: str = Form(""),
+    id_small_d: str = Form(""),
+    id_large_e: str = Form(""),
     r_val: str = Form(""),
+    r1_val: str = Form(""),
+    r2_val: str = Form(""),
+    e_val: str = Form(""),
+    s_neck: str = Form(""),
     hole_h: str = Form(""),
     hole_n: str = Form(""),
+    hole_h2: str = Form(""),
+    hole_n2: str = Form(""),
+    pcd2: str = Form(""),
+    thru_c: str = Form(""),
+    side_hole: str = Form(""),
+    side_hole_depth: str = Form(""),
+    side_a: str = Form(""),
+    side_a_depth: str = Form(""),
     side_b: str = Form(""),
     side_b_depth: str = Form(""),
-    unit_weight: str = Form(...),
+    bottom_hole: str = Form(""),
+    weld_theta: str = Form(""),
+    v1_deg: str = Form(""),
+    v2_deg: str = Form(""),
+    g_val: str = Form(""),
+    f_depth: str = Form(""),
+    unit_weight: str = Form(""),
     file: UploadFile | None = File(default=None),
 ):
     _ensure_tables()
@@ -1235,22 +1291,7 @@ async def update_drawing(
     before = _archive_snapshot(row)
     old_status = str(row.get("status") or "")
     old_drawing_no = str(row.get("drawing_no") or "").strip()
-    dims = {
-        "od_d": od_d,
-        "id_c": id_c,
-        "thk_t": thk_t,
-        "thk_f": thk_f,
-        "mouth_m": mouth_m,
-        "center_k": center_k,
-        "seat_a": seat_a,
-        "seat_h_f": seat_h_f,
-        "r_val": r_val,
-        "hole_h": hole_h,
-        "hole_n": hole_n,
-        "side_b": side_b,
-        "side_b_depth": side_b_depth,
-        "unit_weight": unit_weight,
-    }
+    dims = _dims_from_locals(locals())
     payload = _collect_payload(
         customer_code=customer_code,
         standard_no=standard_no,
@@ -1292,12 +1333,11 @@ async def update_drawing(
     )
     try:
         execute(
-            """
+            f"""
             UPDATE drawing_archives
             SET customer_code=%s, drawing_no=%s, standard_no=%s, drawing_rev_no=%s, material=%s,
                 spec_model=%s, spec=%s, model=%s, material_no=%s, drawing_type=%s,
-                od_d=%s, id_c=%s, thk_t=%s, thk_f=%s, mouth_m=%s, center_k=%s, seat_a=%s, seat_h_f=%s,
-                r_val=%s, hole_h=%s, hole_n=%s, side_b=%s, side_b_depth=%s, unit_weight=%s,
+                {_dim_assign_sql()},
                 drawing_name=%s, storage_relative_path=%s, file_size=%s, content_type=%s,
                 status=%s, review_remark=NULL, reviewed_at=NULL,
                 updated_by_user_id=%s, updated_by_name=%s, updated_at=NOW()
@@ -1314,20 +1354,7 @@ async def update_drawing(
                 payload["model"],
                 payload["material_no"],
                 payload["drawing_type"],
-                payload["od_d"],
-                payload["id_c"],
-                payload["thk_t"],
-                payload["thk_f"],
-                payload["mouth_m"],
-                payload["center_k"],
-                payload["seat_a"],
-                payload["seat_h_f"],
-                payload["r_val"],
-                payload["hole_h"],
-                payload["hole_n"],
-                payload["side_b"],
-                payload["side_b_depth"],
-                payload["unit_weight"],
+                *_dim_values(payload),
                 drawing_name,
                 rel_path,
                 file_size,
@@ -1441,9 +1468,12 @@ def resubmit_drawing(
 def delete_drawing(
     archive_id: int,
     user: Annotated[CurrentUser, Depends(get_current_user)],
+    delete_material: bool = Query(False),
 ):
     _ensure_tables()
     row = _get_archive_or_404(archive_id)
+    if not _can_delete_drawing(row, user):
+        raise HTTPException(status_code=403, detail="仅该条上传者、更新者或董事长可以删除")
     rel = str(row["storage_relative_path"])
     path = _absolute_from_relative(rel)
     file_deleted = False
@@ -1457,6 +1487,17 @@ def delete_drawing(
     drawing_no = str(row.get("drawing_no") or "").strip()
     was_reviewed = str(row.get("status") or "") == STATUS_REVIEWED
     execute("DELETE FROM drawing_archives WHERE id = %s", (archive_id,))
+    material_deleted = None
+    if delete_material:
+        from app.api.v1.workflow import delete_material_matching
+
+        mat_no = str(row.get("material_no") or "").strip()
+        if not mat_no:
+            mat_no = f"{str(row.get('spec') or '').strip()} {str(row.get('model') or '').strip()}".strip()
+        drawing_key = str(row.get("drawing_rev_no") or "").strip() or "-"
+        std_key = str(row.get("standard_no") or "").strip()
+        result = delete_material_matching(material_no=mat_no, drawing_no=drawing_key, standard_no=std_key)
+        material_deleted = bool(result.get("deleted"))
     _write_log(
         archive_id,
         "delete",
@@ -1470,6 +1511,8 @@ def delete_drawing(
             "customer_code": row["customer_code"],
             "drawing_no": row["drawing_no"],
             "status": row.get("status"),
+            "delete_material": delete_material,
+            "material_deleted": material_deleted,
         },
     )
     marked = 0
@@ -1477,4 +1520,9 @@ def delete_drawing(
         from app.api.v1.workflow import mark_pending_doc_status_for_drawing_no
 
         marked = mark_pending_doc_status_for_drawing_no(drawing_no)
-    return {"ok": True, "file_missing_before_delete": file_missing, "re_marked_pending_docs": marked}
+    return {
+        "ok": True,
+        "file_missing_before_delete": file_missing,
+        "re_marked_pending_docs": marked,
+        "material_deleted": material_deleted,
+    }
